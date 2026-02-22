@@ -10,63 +10,67 @@ voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
 evaluation = dict(interval=20)
 dataset_type = 'CustomNuScenesDataset'
-data_root = 'data/nuscenes/'
+data_root = '/home/thx/data-mnt/code/CMT/datasets/V2X-Seq-SPD-New/vehicle-side'
+info_path = '/home/thx/data-mnt/code/CMT/data/infos/V2X-Seq-SPD-New/vehicle-side'
 input_modality = dict(
     use_lidar=True,
     use_camera=False,
     use_radar=False,
     use_map=False,
     use_external=False)
+
+file_client_args = dict(backend="disk")
+
 train_pipeline = [
     dict(
-        type='LoadPointsFromFile',
+        type='LoadPointsFromFile_E2E',
         coord_type='LIDAR',
         load_dim=5,
         use_dim=[0, 1, 2, 3, 4],
-    ),
+        file_client_args=file_client_args,
+        pts_root=data_root),
     dict(
         type='LoadPointsFromMultiSweeps',
         sweeps_num=10,
         use_dim=[0, 1, 2, 3, 4],
     ),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
-    dict(
-        type='ObjectSample',
-        db_sampler=dict(
-            data_root=None,
-            info_path=data_root + 'nuscenes_dbinfos_train.pkl',
-            rate=1.0,
-            prepare=dict(
-                filter_by_difficulty=[-1],
-                filter_by_min_points=dict(
-                    car=5,
-                    truck=5,
-                    bus=5,
-                    trailer=5,
-                    construction_vehicle=5,
-                    traffic_cone=5,
-                    barrier=5,
-                    motorcycle=5,
-                    bicycle=5,
-                    pedestrian=5)),
-            classes=class_names,
-            sample_groups=dict(
-                car=2,
-                truck=3,
-                construction_vehicle=7,
-                bus=4,
-                trailer=6,
-                barrier=2,
-                motorcycle=6,
-                bicycle=6,
-                pedestrian=2,
-                traffic_cone=2),
-            points_loader=dict(
-                type='LoadPointsFromFile',
-                coord_type='LIDAR',
-                load_dim=5,
-                use_dim=[0, 1, 2, 3, 4],
-            ))),
+    # dict(
+        # type='ObjectSample',
+        # db_sampler=dict(
+        #     data_root=None,
+        #     info_path=info_path + '/spd_infos_temporal_train.pkl',
+        #     rate=1.0,
+        #     prepare=dict(
+        #         filter_by_min_points=dict(
+        #             car=5,
+        #             truck=5,
+        #             bus=5,
+        #             trailer=5,
+        #             construction_vehicle=5,
+        #             traffic_cone=5,
+        #             barrier=5,
+        #             motorcycle=5,
+        #             bicycle=5,
+        #             pedestrian=5)),
+        #     classes=class_names,
+        #     sample_groups=dict(
+        #         car=2,
+        #         truck=3,
+        #         construction_vehicle=7,
+        #         bus=4,
+        #         trailer=6,
+        #         barrier=2,
+        #         motorcycle=6,
+        #         bicycle=6,
+        #         pedestrian=2,
+        #         traffic_cone=2),
+        #     points_loader=dict(
+        #         type='LoadPointsFromFile_E2E',
+        #         coord_type='LIDAR',
+        #         load_dim=5,
+        #         use_dim=[0, 1, 2, 3, 4],
+        #     ))),
     dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.3925 * 2, 0.3925 * 2],
@@ -94,11 +98,12 @@ train_pipeline = [
 ]
 test_pipeline = [
     dict(
-        type='LoadPointsFromFile',
+        type='LoadPointsFromFile_E2E',
         coord_type='LIDAR',
         load_dim=5,
         use_dim=[0, 1, 2, 3, 4],
-    ),
+        file_client_args=file_client_args,
+        pts_root=data_root),
     dict(
         type='LoadPointsFromMultiSweeps',
         sweeps_num=10,
@@ -126,22 +131,32 @@ test_pipeline = [
 data = dict(
     samples_per_gpu=2,
     workers_per_gpu=6,
+    # 直接使用 dataset，不用 CBGSDataset：训练集中若某类样本数为 0 会导致 CBGSDataset 内除零
     train=dict(
-        type='CBGSDataset',
-        dataset=dict(
-            type=dataset_type,
-            data_root=data_root,
-            ann_file=data_root + '/nuscenes_infos_train.pkl',
-            load_interval=1,
-            pipeline=train_pipeline,
-            classes=class_names,
-            modality=input_modality,
-            test_mode=False,
-            box_type_3d='LiDAR')),
+        # type='CBGSDataset',
+        # dataset=dict(
+        #     type=dataset_type,
+        #     data_root=data_root,
+        #     ann_file=info_path + '/spd_infos_temporal_train.pkl',
+        #     load_interval=1,
+        #     pipeline=train_pipeline,
+        #     classes=class_names,
+        #     modality=input_modality,
+        #     test_mode=False,
+        #     box_type_3d='LiDAR')),
+        type=dataset_type,
+        data_root=data_root,
+        ann_file=info_path + '/spd_infos_temporal_train.pkl',
+        load_interval=1,
+        pipeline=train_pipeline,
+        classes=class_names,
+        modality=input_modality,
+        test_mode=False,
+        box_type_3d='LiDAR'),
     val=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + '/nuscenes_infos_val.pkl',
+        ann_file=info_path + '/spd_infos_temporal_val.pkl',
         load_interval=1,
         pipeline=test_pipeline,
         classes=class_names,
@@ -151,7 +166,7 @@ data = dict(
     test=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + '/nuscenes_infos_val.pkl',
+        ann_file=info_path + '/spd_infos_temporal_val.pkl',
         load_interval=1,
         pipeline=test_pipeline,
         classes=class_names,
@@ -302,8 +317,8 @@ momentum_config = dict(
     target_ratio=(0.8947368421052632, 1),
     cyclic_times=1,
     step_ratio_up=0.4)
-total_epochs = 20
-checkpoint_config = dict(interval=1)
+total_epochs = 160  # 从 epoch20 续训时需 >20，否则会直接结束
+checkpoint_config = dict(interval=10)
 log_config = dict(
     interval=50,
     hooks=[dict(type='TextLoggerHook'),

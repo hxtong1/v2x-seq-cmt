@@ -7,6 +7,14 @@ import time
 import warnings
 from os import path as osp
 
+# Suppress noisy stderr (e.g. spconv GPU arch) and common warnings; install early.
+def _install_suppress():
+    try:
+        from tools.suppress_warnings import install_suppress
+    except ImportError:
+        from suppress_warnings import install_suppress
+    install_suppress()
+
 import mmcv
 import torch
 import torch.distributed as dist
@@ -115,6 +123,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    _install_suppress()
 
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
@@ -151,7 +160,7 @@ def main():
                 print(_module_path)
                 plg_lib = importlib.import_module(_module_path)
                 
-    plg_lib = importlib.import_module('mmdetection3d.mmdet3d')
+    plg_lib = importlib.import_module('mmdet3d')
 
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
@@ -252,7 +261,7 @@ def main():
         test_cfg=cfg.get('test_cfg'))
     model.init_weights()
 
-    logger.info(f'Model:\n{model}')
+    # logger.info(f'Model:\n{model}')
     datasets = [build_dataset(cfg.data.train)]
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)

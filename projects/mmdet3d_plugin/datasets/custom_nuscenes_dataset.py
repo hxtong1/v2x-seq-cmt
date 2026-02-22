@@ -8,9 +8,100 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 # ------------------------------------------------------------------------
 
+import os
+
 import numpy as np
+from os import path as osp
+
+import mmcv
 from mmdet.datasets import DATASETS
 from mmdet3d.datasets import NuScenesDataset
+from nuscenes.eval.common.loaders import (
+    load_prediction,
+    load_gt,
+    add_center_dist,
+    filter_eval_boxes,
+)
+from nuscenes.eval.common.data_classes import EvalBoxes
+from nuscenes.eval.detection.data_classes import DetectionBox
+from nuscenes.eval.detection.utils import category_to_detection_name
+from nuscenes.eval.detection.evaluate import DetectionEval
+
+
+class _DetectionEvalFromBoxes(DetectionEval):
+    """DetectionEval that uses pre-loaded pred_boxes and gt_boxes (same sample_tokens)."""
+
+    def __init__(self, nusc, config, pred_boxes, gt_boxes, meta, output_dir, verbose=False):
+        self.nusc = nusc
+        self.result_path = ''
+        self.eval_set = ''
+        self.output_dir = output_dir
+        self.verbose = verbose
+        self.cfg = config
+        self.plot_dir = osp.join(self.output_dir, 'plots')
+        if not osp.isdir(self.output_dir):
+            os.makedirs(self.output_dir)
+        if not osp.isdir(self.plot_dir):
+            os.makedirs(self.plot_dir)
+        self.pred_boxes = pred_boxes
+        self.gt_boxes = gt_boxes
+        self.sample_tokens = self.gt_boxes.sample_tokens
+        self.meta = meta
+
+
+def _load_gt_for_sample_tokens(nusc, sample_tokens, box_cls=DetectionBox, verbose=False):
+    """Load GT from nusc for the given sample_tokens (no split filter).
+
+    Use this when the dataset has its own split (e.g. SPD v1.0-trainval) so that
+    load_gt(nusc, 'val') returns no samples. Returns EvalBoxes for only the
+    tokens that exist in nusc.
+    """
+    attribute_map = {a['token']: a['name'] for a in nusc.attribute}
+    all_annotations = EvalBoxes()
+    for sample_token in sample_tokens:
+        try:
+            sample = nusc.get('sample', sample_token)
+        except KeyError:
+            continue
+        sample_annotation_tokens = sample['anns']
+        sample_boxes = []
+        for sample_annotation_token in sample_annotation_tokens:
+            sample_annotation = nusc.get('sample_annotation', sample_annotation_token)
+            cat_name = sample_annotation['category_name']
+            detection_name = category_to_detection_name(cat_name)
+            if detection_name is None:
+                # SPD and similar use short names (car, pedestrian); accept them.
+                if cat_name in ('car', 'truck', 'bus', 'trailer', 'construction_vehicle',
+                               'pedestrian', 'bicycle', 'motorcycle', 'barrier', 'traffic_cone'):
+                    detection_name = cat_name
+                else:
+                    continue
+            attr_tokens = sample_annotation['attribute_tokens']
+            attr_count = len(attr_tokens)
+            if attr_count == 0:
+                attribute_name = ''
+            elif attr_count == 1:
+                attribute_name = attribute_map[attr_tokens[0]]
+            else:
+                attribute_name = attribute_map[attr_tokens[0]]
+            sample_boxes.append(
+                box_cls(
+                    sample_token=sample_token,
+                    translation=sample_annotation['translation'],
+                    size=sample_annotation['size'],
+                    rotation=sample_annotation['rotation'],
+                    velocity=nusc.box_velocity(sample_annotation['token'])[:2],
+                    num_pts=sample_annotation['num_lidar_pts'] + sample_annotation['num_radar_pts'],
+                    detection_name=detection_name,
+                    detection_score=-1.0,
+                    attribute_name=attribute_name,
+                )
+            )
+        all_annotations.add_boxes(sample_token, sample_boxes)
+    if verbose:
+        print('Loaded GT for {} samples (from {} requested).'.format(
+            len(all_annotations.sample_tokens), len(sample_tokens)))
+    return all_annotations
 
 
 @DATASETS.register_module()
@@ -45,9 +136,11 @@ class CustomNuScenesDataset(NuScenesDataset):
         """
         info = self.data_infos[index]
         # standard protocal modified from SECOND.Pytorch
+        lidar_path = info['lidar_path']
+        pts_filename = os.path.splitext(lidar_path)[0] + '.pcd'
         input_dict = dict(
             sample_idx=info['token'],
-            pts_filename=info['lidar_path'],
+            pts_filename=pts_filename,
             sweeps=info['sweeps'],
             timestamp=info['timestamp'] / 1e6,
             img_sweeps=None if 'img_sweeps' not in info else info['img_sweeps'],
@@ -96,3 +189,122 @@ class CustomNuScenesDataset(NuScenesDataset):
             input_dict['ann_info'] = annos
 
         return input_dict
+
+    def _evaluate_single_fallback(self, result_name):
+        """Return zero metrics when official nuScenes eval is not applicable."""
+        metric_prefix = f'{result_name}_NuScenes'
+        detail = dict()
+        for name in self.CLASSES:
+            for k in ['0.5', '1.0', '2.0', '4.0']:
+                detail['{}/{}_AP_dist_{}'.format(metric_prefix, name, k)] = 0.0
+            for err_k in ['trans_err', 'scale_err', 'orient_err', 'vel_err', 'attr_err']:
+                detail['{}/{}_{}'.format(metric_prefix, name, err_k)] = 0.0
+        for err_k, label in self.ErrNameMapping.items():
+            detail['{}/{}'.format(metric_prefix, label)] = 0.0
+        detail['{}/NDS'.format(metric_prefix)] = 0.0
+        detail['{}/mAP'.format(metric_prefix)] = 0.0
+        return detail
+
+    def _evaluate_single(self,
+                         result_path,
+                         logger=None,
+                         metric='bbox',
+                         result_name='pts_bbox'):
+        """Evaluation with custom split: align pred and gt sample_tokens.
+
+        When using a custom val split (e.g. V2X-Seq-SPD), prediction sample_tokens
+        may not match the official nuScenes val split. We filter both to the
+        intersection and run evaluation on that subset.
+        """
+        from nuscenes import NuScenes
+
+        output_dir = osp.join(*osp.split(result_path)[:-1])
+        try:
+            nusc = NuScenes(
+                version=self.version, dataroot=self.data_root, verbose=False)
+        except Exception:
+            return self._evaluate_single_fallback(result_name)
+
+        eval_set_map = {
+            'v1.0-mini': 'mini_val',
+            'v1.0-trainval': 'val',
+        }
+        eval_set = eval_set_map.get(self.version, 'val')
+
+        try:
+            pred_boxes, meta = load_prediction(
+                result_path,
+                self.eval_detection_configs.max_boxes_per_sample,
+                DetectionBox,
+                verbose=False)
+            gt_boxes_full = load_gt(nusc, eval_set, DetectionBox, verbose=False)
+        except Exception:
+            return self._evaluate_single_fallback(result_name)
+
+        pred_tokens = set(pred_boxes.sample_tokens)
+        gt_tokens = set(gt_boxes_full.sample_tokens)
+        common = pred_tokens & gt_tokens
+
+        # If no overlap with official val split (e.g. SPD with own scene names),
+        # load GT from nusc for pred sample_tokens so evaluation still runs.
+        if not common:
+            gt_boxes_by_tokens = _load_gt_for_sample_tokens(
+                nusc, list(pred_tokens), DetectionBox, verbose=False)
+            if gt_boxes_by_tokens.sample_tokens:
+                common = set(gt_boxes_by_tokens.sample_tokens)
+                gt_boxes_full = gt_boxes_by_tokens
+                if logger is not None:
+                    logger.info(
+                        'Using GT loaded by pred sample_tokens (%d samples) '
+                        'instead of official %s.', len(common), eval_set)
+            else:
+                if logger is not None:
+                    logger.warning(
+                        'Custom split has no sample_tokens in common with '
+                        'nuScenes DB. Skipping NuScenes metrics.')
+                return self._evaluate_single_fallback(result_name)
+
+        # Filter to common sample_tokens so pred and gt match
+        pred_filtered = EvalBoxes()
+        gt_filtered = EvalBoxes()
+        for tok in common:
+            pred_filtered.add_boxes(tok, pred_boxes[tok])
+            gt_filtered.add_boxes(tok, gt_boxes_full[tok])
+
+        add_center_dist(nusc, pred_filtered)
+        add_center_dist(nusc, gt_filtered)
+        pred_filtered = filter_eval_boxes(
+            nusc, pred_filtered,
+            self.eval_detection_configs.class_range, verbose=False)
+        gt_filtered = filter_eval_boxes(
+            nusc, gt_filtered,
+            self.eval_detection_configs.class_range, verbose=False)
+
+        # Use a custom evaluator that takes pre-filtered boxes (no load/assert)
+        nusc_eval = _DetectionEvalFromBoxes(
+            nusc=nusc,
+            config=self.eval_detection_configs,
+            pred_boxes=pred_filtered,
+            gt_boxes=gt_filtered,
+            meta=meta,
+            output_dir=output_dir,
+            verbose=False)
+        nusc_eval.main(render_curves=False)
+
+        metrics = mmcv.load(osp.join(output_dir, 'metrics_summary.json'))
+        detail = dict()
+        metric_prefix = f'{result_name}_NuScenes'
+        for name in self.CLASSES:
+            for k, v in metrics['label_aps'][name].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}_AP_dist_{}'.format(metric_prefix, name, k)] = val
+            for k, v in metrics['label_tp_errors'][name].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}_{}'.format(metric_prefix, name, k)] = val
+            for k, v in metrics['tp_errors'].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}'.format(metric_prefix,
+                                      self.ErrNameMapping[k])] = val
+        detail['{}/NDS'.format(metric_prefix)] = metrics['nd_score']
+        detail['{}/mAP'.format(metric_prefix)] = metrics['mean_ap']
+        return detail

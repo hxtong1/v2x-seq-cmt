@@ -3,6 +3,14 @@ import argparse
 import os
 import warnings
 
+# Suppress noisy stderr (e.g. spconv GPU arch) and common warnings; install early.
+def _install_suppress():
+    try:
+        from tools.suppress_warnings import install_suppress
+    except ImportError:
+        from suppress_warnings import install_suppress
+    install_suppress()
+
 import mmcv
 import torch
 from mmcv import Config, DictAction
@@ -129,6 +137,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    _install_suppress()
 
     assert args.out or args.eval or args.format_only or args.show \
         or args.show_dir, \
