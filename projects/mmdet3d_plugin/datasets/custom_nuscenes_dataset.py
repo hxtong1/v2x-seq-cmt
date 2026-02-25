@@ -271,25 +271,39 @@ class CustomNuScenesDataset(NuScenesDataset):
             pred_filtered.add_boxes(tok, pred_boxes[tok])
             gt_filtered.add_boxes(tok, gt_boxes_full[tok])
 
-        add_center_dist(nusc, pred_filtered)
-        add_center_dist(nusc, gt_filtered)
-        pred_filtered = filter_eval_boxes(
-            nusc, pred_filtered,
-            self.eval_detection_configs.class_range, verbose=False)
-        gt_filtered = filter_eval_boxes(
-            nusc, gt_filtered,
-            self.eval_detection_configs.class_range, verbose=False)
+        # Keep nuScenes eval config aligned with dataset classes from config.
+        # This controls both evaluated labels and "Per-class results" printing.
+        eval_detection_configs = self.eval_detection_configs
+        orig_class_names = eval_detection_configs.class_names
+        orig_class_range = eval_detection_configs.class_range
+        eval_detection_configs.class_names = list(self.CLASSES)
+        eval_detection_configs.class_range = {
+            k: v for k, v in orig_class_range.items() if k in self.CLASSES
+        }
 
-        # Use a custom evaluator that takes pre-filtered boxes (no load/assert)
-        nusc_eval = _DetectionEvalFromBoxes(
-            nusc=nusc,
-            config=self.eval_detection_configs,
-            pred_boxes=pred_filtered,
-            gt_boxes=gt_filtered,
-            meta=meta,
-            output_dir=output_dir,
-            verbose=False)
-        nusc_eval.main(render_curves=False)
+        try:
+            add_center_dist(nusc, pred_filtered)
+            add_center_dist(nusc, gt_filtered)
+            pred_filtered = filter_eval_boxes(
+                nusc, pred_filtered,
+                eval_detection_configs.class_range, verbose=False)
+            gt_filtered = filter_eval_boxes(
+                nusc, gt_filtered,
+                eval_detection_configs.class_range, verbose=False)
+
+            # Use a custom evaluator that takes pre-filtered boxes (no load/assert)
+            nusc_eval = _DetectionEvalFromBoxes(
+                nusc=nusc,
+                config=eval_detection_configs,
+                pred_boxes=pred_filtered,
+                gt_boxes=gt_filtered,
+                meta=meta,
+                output_dir=output_dir,
+                verbose=False)
+            nusc_eval.main(render_curves=False)
+        finally:
+            eval_detection_configs.class_names = orig_class_names
+            eval_detection_configs.class_range = orig_class_range
 
         metrics = mmcv.load(osp.join(output_dir, 'metrics_summary.json'))
         detail = dict()

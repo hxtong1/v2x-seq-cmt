@@ -1,11 +1,9 @@
-plugin=True
-plugin_dir='projects/mmdet3d_plugin/'
+plugin = True
+plugin_dir = 'projects/mmdet3d_plugin/'
 
 point_cloud_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
 class_names = [
-    'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
-    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-]
+    'car', 'pedestrian', 'bicycle']
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
 evaluation = dict(interval=20)
@@ -36,41 +34,41 @@ train_pipeline = [
     ),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     # dict(
-        # type='ObjectSample',
-        # db_sampler=dict(
-        #     data_root=None,
-        #     info_path=info_path + '/spd_infos_temporal_train.pkl',
-        #     rate=1.0,
-        #     prepare=dict(
-        #         filter_by_min_points=dict(
-        #             car=5,
-        #             truck=5,
-        #             bus=5,
-        #             trailer=5,
-        #             construction_vehicle=5,
-        #             traffic_cone=5,
-        #             barrier=5,
-        #             motorcycle=5,
-        #             bicycle=5,
-        #             pedestrian=5)),
-        #     classes=class_names,
-        #     sample_groups=dict(
-        #         car=2,
-        #         truck=3,
-        #         construction_vehicle=7,
-        #         bus=4,
-        #         trailer=6,
-        #         barrier=2,
-        #         motorcycle=6,
-        #         bicycle=6,
-        #         pedestrian=2,
-        #         traffic_cone=2),
-        #     points_loader=dict(
-        #         type='LoadPointsFromFile_E2E',
-        #         coord_type='LIDAR',
-        #         load_dim=5,
-        #         use_dim=[0, 1, 2, 3, 4],
-        #     ))),
+    # type='ObjectSample',
+    # db_sampler=dict(
+    #     data_root=None,
+    #     info_path=info_path + '/spd_infos_temporal_train.pkl',
+    #     rate=1.0,
+    #     prepare=dict(
+    #         filter_by_min_points=dict(
+    #             car=5,
+    #             truck=5,
+    #             bus=5,
+    #             trailer=5,
+    #             construction_vehicle=5,
+    #             traffic_cone=5,
+    #             barrier=5,
+    #             motorcycle=5,
+    #             bicycle=5,
+    #             pedestrian=5)),
+    #     classes=class_names,
+    #     sample_groups=dict(
+    #         car=2,
+    #         truck=3,
+    #         construction_vehicle=7,
+    #         bus=4,
+    #         trailer=6,
+    #         barrier=2,
+    #         motorcycle=6,
+    #         bicycle=6,
+    #         pedestrian=2,
+    #         traffic_cone=2),
+    #     points_loader=dict(
+    #         type='LoadPointsFromFile_E2E',
+    #         coord_type='LIDAR',
+    #         load_dim=5,
+    #         use_dim=[0, 1, 2, 3, 4],
+    #     ))),
     dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.3925 * 2, 0.3925 * 2],
@@ -191,7 +189,8 @@ model = dict(
         sparse_shape=[41, 1440, 1440],
         output_channels=128,
         order=('conv', 'norm', 'act'),
-        encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
+        encoder_channels=((16, 16, 32), (32, 32, 64),
+                          (64, 64, 128), (128, 128)),
         encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
         block_type='basicblock'),
     pts_backbone=dict(
@@ -215,13 +214,12 @@ model = dict(
         in_channels=512,
         hidden_dim=256,
         downsample_scale=8,
-        common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
+        common_heads=dict(center=(2, 2), height=(
+            1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
         tasks=[
-            dict(num_class=10, class_names=[
-                'car', 'truck', 'construction_vehicle',
-                'bus', 'trailer', 'barrier',
-                'motorcycle', 'bicycle',
-                'pedestrian', 'traffic_cone'
+            dict(num_class=3, class_names=[
+                'car',
+                'pedestrian', 'bicycle'
             ]),
         ],
         bbox_coder=dict(
@@ -230,7 +228,7 @@ model = dict(
             pc_range=point_cloud_range,
             max_num=300,
             voxel_size=voxel_size,
-            num_classes=10), 
+            num_classes=3),
         separate_head=dict(
             type='SeparateTaskHead', init_bias=-2.19, final_kernel=3),
         transformer=dict(
@@ -252,7 +250,7 @@ model = dict(
                             embed_dims=256,
                             num_heads=8,
                             dropout=0.1),
-                        ],
+                    ],
                     ffn_cfgs=dict(
                         type='FFN',
                         embed_dims=256,
@@ -262,13 +260,15 @@ model = dict(
                         act_cfg=dict(type='ReLU', inplace=True),
                     ),
 
-                    feedforward_channels=1024, #unused
+                    feedforward_channels=1024,  # unused
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                                      'ffn', 'norm')),
             )),
-        loss_cls=dict(type='FocalLoss', use_sigmoid=True, gamma=2, alpha=0.25, reduction='mean', loss_weight=2.0),
+        loss_cls=dict(type='FocalLoss', use_sigmoid=True, gamma=2,
+                      alpha=0.25, reduction='mean', loss_weight=2.0),
         loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=0.25),
-        loss_heatmap=dict(type='GaussianFocalLoss', reduction='mean', loss_weight=1.0),
+        loss_heatmap=dict(type='GaussianFocalLoss',
+                          reduction='mean', loss_weight=1.0),
     ),
     train_cfg=dict(
         pts=dict(
@@ -277,9 +277,11 @@ model = dict(
                 type='HungarianAssigner3D',
                 cls_cost=dict(type='FocalLossCost', weight=2.0),
                 reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
-                iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head. 
+                # Fake cost. This is just to make it compatible with DETR head.
+                iou_cost=dict(type='IoUCost', weight=0.0),
                 pc_range=point_cloud_range,
-                code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
+                code_weights=[2.0, 2.0, 1.0, 1.0,
+                              1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
             ),
             pos_weight=-1,
             gaussian_overlap=0.1,
@@ -301,7 +303,8 @@ model = dict(
             use_rotate_nms=True,
             max_num=200
         )))
-optimizer = dict(type='AdamW', lr=0.0001, weight_decay=0.01)  # for 8gpu * 2sample_per_gpu
+# for 8gpu * 2sample_per_gpu
+optimizer = dict(type='AdamW', lr=0.0001, weight_decay=0.01)
 optimizer_config = dict(
     type='CustomFp16OptimizerHook',
     loss_scale='dynamic',
@@ -330,4 +333,3 @@ load_from = None
 resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)
-
