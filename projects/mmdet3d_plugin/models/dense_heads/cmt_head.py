@@ -225,11 +225,8 @@ class CmtHead(BaseModule):
                  ),
                  tasks=[
                     dict(num_class=1, class_names=['car']),
-                    dict(num_class=2, class_names=['truck', 'construction_vehicle']),
-                    dict(num_class=2, class_names=['bus', 'trailer']),
-                    dict(num_class=1, class_names=['barrier']),
-                    dict(num_class=2, class_names=['motorcycle', 'bicycle']),
-                    dict(num_class=2, class_names=['pedestrian', 'traffic_cone']),
+                    dict(num_class=1, class_names=['bicycle']),
+                    dict(num_class=1, class_names=['pedestrian']),
                  ],
                  transformer=None,
                  bbox_coder=None,

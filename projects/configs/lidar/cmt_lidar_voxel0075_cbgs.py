@@ -217,10 +217,9 @@ model = dict(
         common_heads=dict(center=(2, 2), height=(
             1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
         tasks=[
-            dict(num_class=3, class_names=[
-                'car',
-                'pedestrian', 'bicycle'
-            ]),
+            dict(num_class=1, class_names=['car']),
+            dict(num_class=1, class_names=['pedestrian']),
+            dict(num_class=1, class_names=['bicycle']),
         ],
         bbox_coder=dict(
             type='MultiTaskBBoxCoder',
@@ -320,7 +319,7 @@ momentum_config = dict(
     target_ratio=(0.8947368421052632, 1),
     cyclic_times=1,
     step_ratio_up=0.4)
-total_epochs = 160  # 从 epoch20 续训时需 >20，否则会直接结束
+total_epochs = 48  # 从 epoch20 续训时需 >20，否则会直接结束
 checkpoint_config = dict(interval=10)
 log_config = dict(
     interval=50,
