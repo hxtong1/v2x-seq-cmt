@@ -217,9 +217,7 @@ model = dict(
         common_heads=dict(center=(2, 2), height=(
             1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
         tasks=[
-            dict(num_class=1, class_names=['car']),
-            dict(num_class=1, class_names=['pedestrian']),
-            dict(num_class=1, class_names=['bicycle']),
+            dict(num_class=3, class_names=['car', 'bicycle', 'pedestrian'])
         ],
         bbox_coder=dict(
             type='MultiTaskBBoxCoder',
@@ -263,11 +261,21 @@ model = dict(
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                                      'ffn', 'norm')),
             )),
-        loss_cls=dict(type='FocalLoss', use_sigmoid=True, gamma=2,
-                      alpha=0.25, reduction='mean', loss_weight=2.0),
-        loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=0.25),
-        loss_heatmap=dict(type='GaussianFocalLoss',
-                          reduction='mean', loss_weight=1.0),
+        loss_cls=dict(
+            type='FocalLoss', 
+            use_sigmoid=True, 
+            gamma=2,
+            alpha=0.25, 
+            reduction='mean', 
+            loss_weight=2.0),
+        loss_bbox=dict(
+            type='L1Loss', 
+            reduction='mean', 
+            loss_weight=0.5),
+        loss_heatmap=dict(
+            type='GaussianFocalLoss',
+            reduction='mean', 
+            loss_weight=1.0),
     ),
     train_cfg=dict(
         pts=dict(
@@ -309,11 +317,26 @@ optimizer_config = dict(
     loss_scale='dynamic',
     grad_clip=dict(max_norm=35, norm_type=2),
     custom_fp16=dict(pts_voxel_encoder=False, pts_middle_encoder=False, pts_bbox_head=False))
+# lr_config = dict(
+#     policy='cyclic',
+#     target_ratio=(4, 0.0001),
+#     cyclic_times=2,
+#     step_ratio_up=0.2)
+# lr_config = dict(
+#     policy='step',
+#     step=[24, 36],   # 第 24、36 epoch 降低 lr
+#     gamma=0.1,
+#     warmup='linear', # warmup 可以避免训练初期梯度太大
+#     warmup_iters=500, # 前 500 次迭代线性 warmup
+#     warmup_ratio=1e-3
+# )
 lr_config = dict(
-    policy='cyclic',
-    target_ratio=(6, 0.0001),
-    cyclic_times=1,
-    step_ratio_up=0.4)
+    policy="CosineAnnealing",
+    warmup="linear",
+    warmup_iters=500,
+    warmup_ratio=1/3,
+    min_lr_ratio=1e-2
+)
 momentum_config = dict(
     policy='cyclic',
     target_ratio=(0.8947368421052632, 1),
@@ -328,7 +351,9 @@ log_config = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
-load_from = None
+# load_from = None
 resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)
+load_from = None
+# load_from = '/home/thx/data-mnt/code/CMT/ckps/lidar_voxel0075_epoch20.pth'

@@ -115,6 +115,55 @@ class CustomNuScenesDataset(NuScenesDataset):
         super(CustomNuScenesDataset, self).__init__(*args, **kwargs)
         self.return_gt_info = return_gt_info
 
+    def get_ann_info(self, index):
+        """Override to ensure gt_labels_3d are 0..K-1 aligned with self.CLASSES.
+
+        When using 3-class (or any subset) head with tasks like [car], [pedestrian],
+        [bicycle], the head matches gt_labels_3d by (task_id, flag): task0 expects
+        label 0, task1 expects 1, task2 expects 2. If the parent or pkl provides
+        labels from another scheme (e.g. nuScenes 10-class: car=0, pedestrian=6,
+        bicycle=7), task1/task2 would get num_total_pos=0 -> bbox loss div by zero
+        and grad_norm nan. So we always recompute gt_labels_3d from gt_names using
+        self.CLASSES and drop boxes not in self.CLASSES.
+        """
+        annos = super(CustomNuScenesDataset, self).get_ann_info(index)
+        if 'gt_names' not in annos:
+            return annos
+        gt_names = annos['gt_names']
+        # Recompute labels so that label = self.CLASSES.index(name) -> 0..K-1
+        keep = []
+        new_labels = []
+        new_names = []
+        for i, name in enumerate(gt_names):
+            if name in self.CLASSES:
+                keep.append(i)
+                new_labels.append(self.CLASSES.index(name))
+                new_names.append(name)
+        if not keep:
+            # No box in CLASSES: return empty but consistent structure
+            annos['gt_labels_3d'] = np.array([], dtype=np.int64)
+            if 'gt_names' in annos:
+                annos['gt_names'] = np.array([], dtype=object)
+            if hasattr(annos['gt_bboxes_3d'], 'tensor'):
+                from mmdet3d.core.bbox import LiDARInstance3DBoxes
+                box_dim = annos['gt_bboxes_3d'].tensor.shape[1]
+                annos['gt_bboxes_3d'] = LiDARInstance3DBoxes(
+                    np.zeros((0, box_dim), dtype=np.float32), box_dim=box_dim)
+            else:
+                annos['gt_bboxes_3d'] = np.zeros((0, annos['gt_bboxes_3d'].shape[1]), dtype=np.float32)
+            return annos
+        keep = np.asarray(keep)
+        annos['gt_labels_3d'] = np.array(new_labels, dtype=np.int64)
+        annos['gt_names'] = np.array(new_names, dtype=object)
+        annos['gt_bboxes_3d'] = annos['gt_bboxes_3d'][keep]
+        for k in list(annos.keys()):
+            if k in ('gt_bboxes_3d', 'gt_labels_3d', 'gt_names'):
+                continue
+            v = annos[k]
+            if isinstance(v, np.ndarray) and len(v) == len(gt_names):
+                annos[k] = v[keep]
+        return annos
+
     def get_data_info(self, index):
         """Get data info according to the given index.
 

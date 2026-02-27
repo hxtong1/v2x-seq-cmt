@@ -32,7 +32,7 @@ from mmdet3d.core import (circle_nms, draw_heatmap_gaussian, gaussian_radius,
                           xywhr2xyxyr)
 from einops import rearrange
 import collections
-
+from .cmt_head import CmtHead, CmtLidarHead
 from functools import reduce
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
 
@@ -204,116 +204,30 @@ class SeparateTaskHead(BaseModule):
 
 
 @HEADS.register_module()
-class CmtHead(BaseModule):
+class CmtDetHead(CmtLidarHead):
 
     def __init__(self,
-                 in_channels,
-                 num_query=900,
-                 hidden_dim=128,
-                 depth_num=64,
-                 norm_bbox=True,
-                 downsample_scale=8,
-                 scalar=10,
-                 noise_scale=1.0,
-                 noise_trans=0.0,
-                 dn_weight=1.0,
-                 split=0.75,
-                 train_cfg=None,
-                 test_cfg=None,
-                 common_heads=dict(
-                     center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)
-                 ),
-                 tasks=[
-                    dict(num_class=3, class_names=['car','bicycle', 'pedestrian'])
-                 ],
+                 *args,
                  transformer=None,
-                 bbox_coder=None,
-                 loss_cls=dict(
-                     type="FocalLoss",
-                     use_sigmoid=True,
-                     reduction="mean",
-                     gamma=2, alpha=0.25, loss_weight=1.0
-                 ),
-                 loss_bbox=dict(
-                    type="L1Loss",
-                    reduction="mean",
-                    loss_weight=0.25,
-                 ),
-                 loss_heatmap=dict(
-                     type="GaussianFocalLoss",
-                     reduction="mean"
-                 ),
-                 separate_head=dict(
-                     type='SeparateMlpHead', init_bias=-2.19, final_kernel=3),
-                 init_cfg=None,
+                 bev_h=120,
+                 bev_w=120,
                  **kwargs):
-        assert init_cfg is None
-        super(CmtHead, self).__init__(init_cfg=init_cfg)
-        self.num_classes = [len(t["class_names"]) for t in tasks]
-        self.class_names = [t["class_names"] for t in tasks]
-        self.hidden_dim = hidden_dim
-        self.train_cfg = train_cfg
-        self.test_cfg = test_cfg
-        self.num_query = num_query
-        self.in_channels = in_channels
-        self.depth_num = depth_num
-        self.norm_bbox = norm_bbox
-        self.downsample_scale = downsample_scale
-        self.scalar = scalar
-        self.bbox_noise_scale = noise_scale
-        self.bbox_noise_trans = noise_trans
-        self.dn_weight = dn_weight
-        self.split = split
-
-        self.loss_cls = build_loss(loss_cls)
-        self.loss_bbox = build_loss(loss_bbox)
-        self.loss_heatmap = build_loss(loss_heatmap)
-        self.bbox_coder = build_bbox_coder(bbox_coder)
+        super(CmtDetHead, self).__init__(
+            
+            transformer=transformer, 
+            **kwargs)
+        
         self.pc_range = self.bbox_coder.pc_range
         self.fp16_enabled = False
-           
-        self.shared_conv = ConvModule(
-            in_channels,
-            hidden_dim,
-            kernel_size=3,
-            padding=1,
-            conv_cfg=dict(type="Conv2d"),
-            norm_cfg=dict(type="BN2d")
-        )
-        
+        self.bev_h = bev_h
+        self.bev_w = bev_w
+        self.real_w = self.pc_range[3] - self.pc_range[0]
+        self.real_h = self.pc_range[4] - self.pc_range[1]
         # transformer
         self.transformer = build_transformer(transformer)
-        self.reference_points = nn.Embedding(num_query, 3)
-        self.bev_embedding = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        self.rv_embedding = nn.Sequential(
-            nn.Linear(self.depth_num * 3, self.hidden_dim * 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.hidden_dim * 4, self.hidden_dim)
-        )
-        # task head
-        self.task_heads = nn.ModuleList()
-        for num_cls in self.num_classes:
-            heads = copy.deepcopy(common_heads)
-            heads.update(dict(cls_logits=(num_cls, 2)))
-            separate_head.update(
-                in_channels=hidden_dim,
-                heads=heads, num_cls=num_cls,
-                groups=transformer.decoder.num_layers
-            )
-            self.task_heads.append(builder.build_head(separate_head))
-
-        # assigner
-        if train_cfg:
-            self.assigner = build_assigner(train_cfg["assigner"])
-            sampler_cfg = dict(type='PseudoSampler')
-            self.sampler = build_sampler(sampler_cfg, context=self)
 
     def init_weights(self):
-        super(CmtHead, self).init_weights()
+        super(CmtDetHead, self).init_weights()
         nn.init.uniform_(self.reference_points.weight.data, 0, 1)
 
     @property
@@ -331,141 +245,26 @@ class CmtHead(BaseModule):
         coord_base = coord_base.view(2, -1).transpose(1, 0) # (H*W, 2)
         return coord_base
 
-    def prepare_for_dn(self, batch_size, reference_points, img_metas):
-        if self.training:
-            targets = [torch.cat((img_meta['gt_bboxes_3d']._data.gravity_center, img_meta['gt_bboxes_3d']._data.tensor[:, 3:]),dim=1) for img_meta in img_metas ]
-            labels = [img_meta['gt_labels_3d']._data for img_meta in img_metas ]
-            known = [(torch.ones_like(t)).cuda() for t in labels]
-            know_idx = known
-            unmask_bbox = unmask_label = torch.cat(known)
-            known_num = [t.size(0) for t in targets]
-            labels = torch.cat([t for t in labels])
-            boxes = torch.cat([t for t in targets])
-            batch_idx = torch.cat([torch.full((t.size(0), ), i) for i, t in enumerate(targets)])
-
-            known_indice = torch.nonzero(unmask_label + unmask_bbox)
-            known_indice = known_indice.view(-1)
-            # add noise
-            groups = min(self.scalar, self.num_query // max(known_num))
-            known_indice = known_indice.repeat(groups, 1).view(-1)
-            known_labels = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
-            known_labels_raw = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
-            known_bid = batch_idx.repeat(groups, 1).view(-1)
-            known_bboxs = boxes.repeat(groups, 1).to(reference_points.device)
-            known_bbox_center = known_bboxs[:, :3].clone()
-            known_bbox_scale = known_bboxs[:, 3:6].clone()
-            
-            if self.bbox_noise_scale > 0:
-                diff = known_bbox_scale / 2 + self.bbox_noise_trans
-                rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
-                known_bbox_center += torch.mul(rand_prob,
-                                            diff) * self.bbox_noise_scale
-                known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
-                known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
-                known_bbox_center[..., 2:3] = (known_bbox_center[..., 2:3] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
-                known_bbox_center = known_bbox_center.clamp(min=0.0, max=1.0)
-                mask = torch.norm(rand_prob, 2, 1) > self.split
-                known_labels[mask] = sum(self.num_classes)
-
-            single_pad = int(max(known_num))
-            pad_size = int(single_pad * groups)
-            padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)
-            padded_reference_points = torch.cat([padding_bbox, reference_points], dim=0).unsqueeze(0).repeat(batch_size, 1, 1)
-
-            if len(known_num):
-                map_known_indice = torch.cat([torch.tensor(range(num)) for num in known_num])  # [1,2, 1,2,3]
-                map_known_indice = torch.cat([map_known_indice + single_pad * i for i in range(groups)]).long()
-            if len(known_bid):
-                padded_reference_points[(known_bid.long(), map_known_indice)] = known_bbox_center.to(reference_points.device)
-
-            tgt_size = pad_size + self.num_query
-            attn_mask = torch.ones(tgt_size, tgt_size).to(reference_points.device) < 0
-            # match query cannot see the reconstruct
-            attn_mask[pad_size:, :pad_size] = True
-            # reconstruct cannot see each other
-            for i in range(groups):
-                if i == 0:
-                    attn_mask[single_pad * i:single_pad * (i + 1), single_pad * (i + 1):pad_size] = True
-                if i == groups - 1:
-                    attn_mask[single_pad * i:single_pad * (i + 1), :single_pad * i] = True
-                else:
-                    attn_mask[single_pad * i:single_pad * (i + 1), single_pad * (i + 1):pad_size] = True
-                    attn_mask[single_pad * i:single_pad * (i + 1), :single_pad * i] = True
-
-            mask_dict = {
-                'known_indice': torch.as_tensor(known_indice).long(),
-                'batch_idx': torch.as_tensor(batch_idx).long(),
-                'map_known_indice': torch.as_tensor(map_known_indice).long(),
-                'known_lbs_bboxes': (known_labels, known_bboxs),
-                'known_labels_raw': known_labels_raw,
-                'know_idx': know_idx,
-                'pad_size': pad_size
-            }
-            
-        else:
-            padded_reference_points = reference_points.unsqueeze(0).repeat(batch_size, 1, 1)
-            attn_mask = None
-            mask_dict = None
-
-        return padded_reference_points, attn_mask, mask_dict
-
-    def _rv_pe(self, img_feats, img_metas):
-        BN, C, H, W = img_feats.shape
-        pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
-        coords_h = torch.arange(H, device=img_feats[0].device).float() * pad_h / H
-        coords_w = torch.arange(W, device=img_feats[0].device).float() * pad_w / W
-        coords_d = 1 + torch.arange(self.depth_num, device=img_feats[0].device).float() * (self.pc_range[3] - 1) / self.depth_num
-        coords_h, coords_w, coords_d = torch.meshgrid([coords_h, coords_w, coords_d])
-
-        coords = torch.stack([coords_w, coords_h, coords_d, coords_h.new_ones(coords_h.shape)], dim=-1)
-        coords[..., :2] = coords[..., :2] * coords[..., 2:3]
+    def get_bev_features(self, mlvl_feats, img_metas, prev_bev=None):
+        bs, _, _, _, _ = mlvl_feats[0].shape
+        dtype = mlvl_feats[0].dtype
+        bev_queries = self.bev_embedding.weight.to(dtype)
         
-        imgs2lidars = np.concatenate([np.linalg.inv(meta['lidar2img']) for meta in img_metas])
-        imgs2lidars = torch.from_numpy(imgs2lidars).float().to(coords.device)
-        coords_3d = torch.einsum('hwdo, bco -> bhwdc', coords, imgs2lidars)
-        coords_3d = (coords_3d[..., :3] - coords_3d.new_tensor(self.pc_range[:3])[None, None, None, :] )\
-                        / (coords_3d.new_tensor(self.pc_range[3:]) - coords_3d.new_tensor(self.pc_range[:3]))[None, None, None, :]
-        return self.rv_embedding(coords_3d.reshape(*coords_3d.shape[:-2], -1))
-
-    def _bev_query_embed(self, ref_points, img_metas):
-        bev_embeds = self.bev_embedding(pos2embed(ref_points, num_pos_feats=self.hidden_dim))
-        return bev_embeds
-
-    def _rv_query_embed(self, ref_points, img_metas):
-        pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
-        lidars2imgs = np.stack([meta['lidar2img'] for meta in img_metas])
-        lidars2imgs = torch.from_numpy(lidars2imgs).float().to(ref_points.device)
-        imgs2lidars = np.stack([np.linalg.inv(meta['lidar2img']) for meta in img_metas])
-        imgs2lidars = torch.from_numpy(imgs2lidars).float().to(ref_points.device)
-
-        ref_points = ref_points * (ref_points.new_tensor(self.pc_range[3:]) - ref_points.new_tensor(self.pc_range[:3])) + ref_points.new_tensor(self.pc_range[:3])
-        proj_points = torch.einsum('bnd, bvcd -> bvnc', torch.cat([ref_points, ref_points.new_ones(*ref_points.shape[:-1], 1)], dim=-1), lidars2imgs)
-        
-        proj_points_clone = proj_points.clone()
-        z_mask = proj_points_clone[..., 2:3].detach() > 0
-        proj_points_clone[..., :3] = proj_points[..., :3] / (proj_points[..., 2:3].detach() + z_mask * 1e-6 - (~z_mask) * 1e-6) 
-        # proj_points_clone[..., 2] = proj_points.new_ones(proj_points[..., 2].shape) 
-        
-        mask = (proj_points_clone[..., 0] < pad_w) & (proj_points_clone[..., 0] >= 0) & (proj_points_clone[..., 1] < pad_h) & (proj_points_clone[..., 1] >= 0)
-        mask &= z_mask.squeeze(-1)
-
-        coords_d = 1 + torch.arange(self.depth_num, device=ref_points.device).float() * (self.pc_range[3] - 1) / self.depth_num
-        proj_points_clone = torch.einsum('bvnc, d -> bvndc', proj_points_clone, coords_d)
-        proj_points_clone = torch.cat([proj_points_clone[..., :3], proj_points_clone.new_ones(*proj_points_clone.shape[:-1], 1)], dim=-1)
-        projback_points = torch.einsum('bvndo, bvco -> bvndc', proj_points_clone, imgs2lidars)
-
-        projback_points = (projback_points[..., :3] - projback_points.new_tensor(self.pc_range[:3])[None, None, None, :] )\
-                        / (projback_points.new_tensor(self.pc_range[3:]) - projback_points.new_tensor(self.pc_range[:3]))[None, None, None, :]
-        
-        rv_embeds = self.rv_embedding(projback_points.reshape(*projback_points.shape[:-2], -1))
-        rv_embeds = (rv_embeds * mask.unsqueeze(-1)).sum(dim=1)
-        return rv_embeds
-
-    def query_embed(self, ref_points, img_metas):
-        ref_points = inverse_sigmoid(ref_points.clone()).sigmoid()
-        bev_embeds = self._bev_query_embed(ref_points, img_metas)
-        rv_embeds = self._rv_query_embed(ref_points, img_metas)
-        return bev_embeds, rv_embeds
+        bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),
+                               device=bev_queries.device).to(dtype)
+        bev_pos = self.positional_encoding(bev_mask).to(dtype)
+        bev_embed = self.transformer(
+            mlvl_feats,
+            bev_queries,
+            self.bev_h,
+            self.bev_w,
+            grid_length=(self.real_h / self.bev_h,
+                         self.real_w / self.bev_w),
+            bev_pos=bev_pos,
+            prev_bev=prev_bev,
+            img_metas=img_metas,
+        )
+        return bev_embed, bev_pos
 
     def forward_single(self, x, x_img, img_metas):
         """
