@@ -305,25 +305,29 @@ def rotation_z2quaternion(rotation_z):
     return q
 
 
-def generate_sample_annotation_json(total_annotations, data_root, version='v1.0-mini', local_root=''):
+def generate_sample_annotation_json(total_annotations, spd_infos, sample_info_mappings, data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating sample annotation json ---------------------")
     import numpy as np
     from pyquaternion import Quaternion
 
+    spd_info_map = {info['token']: info for info in spd_infos}
+
     sample_annotation_infos = []
     for sample_token in total_annotations.keys():
         annotations = total_annotations[sample_token]
-        scene_token = sample_info_mappings[sample_token]['scene_token']
-        frame_idx = sample_info_mappings[sample_token]['frame_idx']
-        timestamp = sample_info_mappings[sample_token]['timestamp']
+        sample_info = sample_info_mappings[sample_token]
+        scene_token = sample_info['scene_token']
 
-        for info in spd_infos:
-            if info['token'] == sample_token:
-                sample_lidar2ego_rotation = Quaternion(info['lidar2ego_rotation'])
-                sample_lidar2ego_translation = np.array(info['lidar2ego_translation'])
-                sample_ego2global_rotation = Quaternion(info['ego2global_rotation'])
-                sample_ego2global_translation = np.array(info['ego2global_translation'])
-                break
+        spd_info = spd_info_map.get(sample_token)
+        if spd_info is None:
+            continue
+        sample_lidar2ego_rotation = Quaternion(spd_info['lidar2ego_rotation'])
+        sample_lidar2ego_translation = np.array(spd_info['lidar2ego_translation'])
+        sample_ego2global_rotation = Quaternion(spd_info['ego2global_rotation'])
+        sample_ego2global_translation = np.array(spd_info['ego2global_translation'])
+
+        anno_to_idx = {t: i for i, t in enumerate(spd_info.get('anno_tokens', []))}
+        num_lidar_pts_arr = spd_info.get('num_lidar_pts', np.zeros(0))
 
         for anno_token in annotations.keys():
             annotation = annotations[anno_token]
@@ -341,27 +345,28 @@ def generate_sample_annotation_json(total_annotations, data_root, version='v1.0-
             center = np.dot(sample_ego2global_rotation.rotation_matrix, center) + sample_ego2global_translation
             rot = sample_ego2global_rotation * rot
 
-            info = {
+            idx = anno_to_idx.get(anno_token, -1)
+            num_lidar_pts = int(num_lidar_pts_arr[idx]) if idx >= 0 and idx < len(num_lidar_pts_arr) else 0
+            # attribute_tokens: nuScenes uses token strings; keep [] if no mapping
+            attribute_tokens = []
+
+            ann_info = {
                 'token': annotation['token'],
                 'sample_token': sample_token,
                 'instance_token': annotation['instance_token'],
                 'visibility_token': visibility_mappings[annotation['occluded_state']],
-                'attribute_tokens': [],
-                # 'translation': [annotation['3d_location']['x'], annotation['3d_location']['y'],
-                #                             annotation['3d_location']['z']],
+                'attribute_tokens': attribute_tokens,
                 'translation': center.tolist(),
                 'size': [annotation['3d_dimensions']['w'], annotation['3d_dimensions']['l'],
                          annotation['3d_dimensions']['h']],
-                # 'rotation': rotation_z2quaternion(annotation['rotation']),
-                # 'rotation': pyquaternion.Quaternion(axis=[0, 0, 1], radians=annotation['rotation']),
                 'rotation': rot.elements.tolist(),
                 'prev': annotation['prev'],
                 'next': annotation['next'],
-                'num_lidar_pts': 100,
+                'num_lidar_pts': num_lidar_pts,
                 'num_radar_pts': 0
             }
 
-            sample_annotation_infos.append(info)
+            sample_annotation_infos.append(ann_info)
 
     target_file_path = osp.join(data_root, version, 'sample_annotation.json')
     write_json(sample_annotation_infos, target_file_path)
@@ -498,6 +503,8 @@ if __name__ == "__main__":
                               local_root=local_root)
 
     generate_sample_annotation_json(total_annotations,
+                                    spd_infos,
+                                    sample_info_mappings,
                                     save_root,
                                     version=version,
                                     local_root=local_root)
