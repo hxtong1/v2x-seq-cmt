@@ -26,17 +26,25 @@ import uuid
 from scipy.linalg import polar
 from tools.spd_data_converter.spd_prediction_tools import get_forecasting_annotations
 import os
-import psutil
-from queue import Queue
-QUEUE_MAXSIZE = 64
+
 # GlOBAL
 
 TOTAL_CPU = os.cpu_count()
 RESERVE_CPU = 2  # 系统保留
-MAX_AVAILABLE = TOTAL_CPU - RESERVE_CPU
+MAX_AVAILABLE = max(1, TOTAL_CPU - RESERVE_CPU)
 
-NUM_PROCESSES = min(MAX_AVAILABLE, 8)  # 每帧进程数
-WORKERS_PER_PROCESS = max(1, MAX_AVAILABLE // NUM_PROCESSES)
+# 进程池：每个 worker 独立加载点云，内存占用大。限制数量减少 OOM。
+PROCESS_POOL_MAX_WORKERS = min(4, MAX_AVAILABLE)
+
+# 线程池：共享主进程内存。I/O 类可多用，CPU 类适度即可。
+THREAD_POOL_IO_WORKERS = min(12, MAX_AVAILABLE)   # 读 JSON 等 I/O
+THREAD_POOL_CPU_WORKERS = min(8, MAX_AVAILABLE)   # annotation 转换等 CPU 密集
+# create_spd_infos: ProcessPool 并行（绕过 GIL），worker 数可提高
+CREATE_SPD_INFOS_WORKERS = min(8, MAX_AVAILABLE)
+
+# 兼容旧逻辑的别名
+NUM_PROCESSES = PROCESS_POOL_MAX_WORKERS
+WORKERS_PER_PROCESS = max(1, THREAD_POOL_CPU_WORKERS)
 
 to_remove_list_veh = ['015389', '015390', '015391', '015392', '015393', '015394', '015395', '015396', '015397', '015398', '015399', '004394', '004395', '004396', '004397', '004398', '004399',
                       '004400', '004401', '004402', '004403', '004404', '004405', '004406', '004407', '004408', '004409', '004411', '004412', '004413', '002060', '002061', '002062', '002063',
@@ -86,12 +94,19 @@ ATTRIBUTE_MAPPING = {
 
 
 def orthonormalize_rotation(R):
-    """ 
-    Fix non-orthogonal rotation matrix issues using SVD. 
-    (Replaces the mathematically incorrect ICP call for 3x3 matrices).
     """
+    Fix non-orthogonal rotation matrix using SVD. Returns proper rotation (det=+1).
+    Ensures matrix is valid for pyquaternion.Quaternion(matrix=...).
+    """
+    R = np.array(R, dtype=np.float64)
     U, S, Vt = np.linalg.svd(R)
-    return U @ Vt
+    R_orth = U @ Vt
+    # Ensure proper rotation (det=+1), not reflection (det=-1)
+    if np.linalg.det(R_orth) < 0:
+        U = U.copy()
+        U[:, -1] *= -1
+        R_orth = U @ Vt
+    return R_orth.astype(np.float32)
 
 
 def iterative_closest_point(A, num_iterations=100):
@@ -539,9 +554,9 @@ def get_lidar_ego_global_infos(root_path, data_infos, v2x_side):
         lidar_ego_global_infos[sample_token] = {}
 
         if v2x_side == 'infrastructure-side':
-            # lidar -> ego 默认 identity
-            lidar_ego_global_infos[sample_token]['lidar2ego_rotation'] = np.eye(
-                3, dtype=np.float32)
+            # lidar -> ego 默认 identity，用单位四元数表示，方便后续构造 Quaternion
+            lidar_ego_global_infos[sample_token]['lidar2ego_rotation'] = np.array(
+                [1.0, 0.0, 0.0, 0.0], dtype=np.float32)
             lidar_ego_global_infos[sample_token]['lidar2ego_translation'] = np.zeros(
                 3, dtype=np.float32)
 
@@ -550,12 +565,15 @@ def get_lidar_ego_global_infos(root_path, data_infos, v2x_side):
                 root_path, data_info['calib_virtuallidar_to_world_path'])
             calib = load_json(calib_path)
 
-            R = np.array(calib['rotation'], dtype=np.float32)
+            R = np.array(calib['rotation'], dtype=np.float32).reshape(3, 3)
             t = np.array(calib['translation'], dtype=np.float32).reshape(3)
 
-            # 使用 SVD 正交化
             R = orthonormalize_rotation(R)
-            q = Quaternion(matrix=R)
+            try:
+                q = Quaternion(matrix=R)
+            except ValueError:
+                R = iterative_closest_point(R.astype(np.float64))
+                q = Quaternion(matrix=R)
 
             lidar_ego_global_infos[sample_token]['ego2global_rotation'] = np.array(
                 [q.w, q.x, q.y, q.z], dtype=np.float32)
@@ -583,7 +601,11 @@ def get_lidar_ego_global_infos(root_path, data_infos, v2x_side):
                 np.array(calib_e2g['rotation'], dtype=np.float32))
             t_e2g = np.array(calib_e2g['translation'],
                              dtype=np.float32).reshape(3)
-            q_e2g = Quaternion(matrix=R_e2g)
+            try:
+                q_e2g = Quaternion(matrix=R_e2g)
+            except ValueError:
+                R_e2g = iterative_closest_point(R_e2g.astype(np.float64))
+                q_e2g = Quaternion(matrix=R_e2g)
             lidar_ego_global_infos[sample_token]['ego2global_rotation'] = np.array(
                 [q_e2g.w, q_e2g.x, q_e2g.y, q_e2g.z], dtype=np.float32)
             lidar_ego_global_infos[sample_token]['ego2global_translation'] = t_e2g
@@ -690,7 +712,8 @@ def generate_sweeps(sample_token, sample_info_mappings, data_infos_mapping, max_
     while len(sweeps) < max_sweeps and prev_token != '' and prev_token in data_infos_mapping:
         sweep_info = data_infos_mapping[prev_token]
         ts = float(sweep_info['timestamp'])
-        rel_time = (cur_timestamp - ts) / 1e6 if ts > 1e10 else (cur_timestamp - ts)
+        rel_time = (cur_timestamp - ts) / \
+            1e6 if ts > 1e10 else (cur_timestamp - ts)
         sweeps.append({
             'lidar_path': sweep_info['lidar_path'].replace('.pcd', '.bin'),
             'timestamp': rel_time,
@@ -807,9 +830,8 @@ def _generate_unvisible_annotations(
     对不可见目标进行插值补全位置（visibility 为 occluded 的对象）。
     主要用于预测或速度计算。
     """
-    output_queue = Queue(maxsize=QUEUE_MAXSIZE)
-
-    def process_instance(instance_token, output_queue):
+    def process_instance(instance_token):
+        results = []
         cur_instance_samples = instance_token_mappings[instance_token]
 
         for ii in range(len(cur_instance_samples) - 1):
@@ -861,26 +883,19 @@ def _generate_unvisible_annotations(
                     "rotation": cur_rot,
                     "instance_token": instance_token
                 }
-
-                # 直接把结果放到队列里，不生成 dict
-                output_queue.put(
-                    (cur_sample_token, cur_anno_token, cur_instance_sample_anno))
+                results.append((cur_sample_token, cur_anno_token, cur_instance_sample_anno))
                 cur_frame_idx += 1
+        return results
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_instance, inst, output_queue)
+        futures = [executor.submit(process_instance, inst)
                    for inst in instance_token_mappings]
 
-        # 等待所有线程完成
-        for f in as_completed(futures):
-            f.result()  # 保证异常可以抛出
-
-    # 主线程合并结果
-    while not output_queue.empty():
-        sample_token, anno_token, anno = output_queue.get()
-        if sample_token not in total_annotations:
-            total_annotations[sample_token] = {}
-        total_annotations[sample_token][anno_token] = anno
+        for f in tqdm(as_completed(futures), total=len(futures), desc="annotation_track"):
+            for sample_token, anno_token, anno in f.result():
+                if sample_token not in total_annotations:
+                    total_annotations[sample_token] = {}
+                total_annotations[sample_token][anno_token] = anno
 
     return total_annotations
 
@@ -889,7 +904,7 @@ def _add_annotation_velocity_prev_next(
     total_annotations,
     instance_token_mappings,
     lidar_ego_global_infos,
-    max_workers=NUM_PROCESSES
+    max_workers=None
 ):
     """
     Generate velocity and prev/next token for annotations in NuScenes style.
@@ -902,6 +917,8 @@ def _add_annotation_velocity_prev_next(
     Returns:
         total_annotations, instance_token_mappings
     """
+    if max_workers is None:
+        max_workers = THREAD_POOL_CPU_WORKERS
     def process_instance(instance_token, samples):
         updated_samples = []
         num_samples = len(samples)
@@ -938,21 +955,26 @@ def _add_annotation_velocity_prev_next(
                                       1]['annotation']['token'] if ii < num_samples - 1 else ''
 
             try:
+                # timestamps in sample_info_mappings are already in seconds
                 if ii < num_samples - 1:
-                    t0 = float(curr_sample['timestamp']) / 1e6
-                    t1 = float(samples[ii + 1]['timestamp']) / 1e6
+                    t0 = float(curr_sample['timestamp'])
+                    t1 = float(samples[ii + 1]['timestamp'])
                     p0 = get_global_center(curr_sample)
                     p1 = get_global_center(samples[ii + 1])
                 elif num_samples > 1:
-                    t0 = float(samples[ii - 1]['timestamp']) / 1e6
-                    t1 = float(curr_sample['timestamp']) / 1e6
+                    t0 = float(samples[ii - 1]['timestamp'])
+                    t1 = float(curr_sample['timestamp'])
                     p0 = get_global_center(samples[ii - 1])
                     p1 = get_global_center(curr_sample)
                 else:
-                    t0, t1, p0, p1 = 0, 1, np.zeros(3), np.zeros(3)
+                    t0, t1, p0, p1 = 0.0, 1.0, np.zeros(3), np.zeros(3)
 
                 dt = t1 - t0
-                gt_velocity = (p1 - p0) / dt if dt > 0 else np.zeros(3)
+                # Guard against extremely small dt to avoid exploding velocities
+                if dt > 1e-3:
+                    gt_velocity = (p1 - p0) / dt
+                else:
+                    gt_velocity = np.zeros(3)
 
             except KeyError:
                 gt_velocity = np.zeros(3)
@@ -970,7 +992,7 @@ def _add_annotation_velocity_prev_next(
             futures.append(executor.submit(
                 process_instance, instance_token, samples))
 
-        for fut in as_completed(futures):
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="velocity_prev_next"):
             instance_token, updated_samples = fut.result()
             instance_token_mappings[instance_token] = updated_samples
             # 更新 total_annotations 对应每帧
@@ -1109,7 +1131,7 @@ def _generate_sample_infos_coop(coop_data_infos, veh_data_infos, inf_data_infos)
     return sample_infos, sample_info_mappings
 
 
-def _get_total_annotations(root_path, data_infos, sample_info_mappings, max_workers=NUM_PROCESSES):
+def _get_total_annotations(root_path, data_infos, sample_info_mappings, max_workers=None):
     """
     Load all annotation JSONs for vehicle-side or infrastructure-side dataset.
 
@@ -1117,11 +1139,13 @@ def _get_total_annotations(root_path, data_infos, sample_info_mappings, max_work
         root_path (str): 数据根路径
         data_infos (list): 已加载的 data_info 列表
         sample_info_mappings (dict): sample_token -> sample_info
-        max_workers (int): 多线程读取 JSON 数量
+        max_workers (int): 多线程读取 JSON 数量（I/O bound，默认 THREAD_POOL_IO_WORKERS）
 
     Returns:
         dict: {frame_id: {anno_token: anno_dict}}
     """
+    if max_workers is None:
+        max_workers = THREAD_POOL_IO_WORKERS
 
     def load_single_annotation(data_info):
         sample_token = data_info['frame_id']
@@ -1143,14 +1167,361 @@ def _get_total_annotations(root_path, data_infos, sample_info_mappings, max_work
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(load_single_annotation, di)
                    for di in data_infos]
-        for f in tqdm(futures, desc="Loading annotations"):
+        for f in tqdm(as_completed(futures), total=len(futures), desc="Loading annotations"):
             sample_token, ann_dict = f.result()
             total_annotations[sample_token] = ann_dict
 
     return total_annotations
 
 
-def _get_total_annotations_coop(root_path, data_infos, sample_info_mappings, max_workers=NUM_PROCESSES):
+# Worker state for ProcessPoolExecutor (set by initializer, read by worker)
+_CREATE_SPD_WORKER_STATE = None
+
+
+def _init_create_spd_worker(worker_state):
+    """Set shared state for create_spd_infos workers (called once per process)."""
+    global _CREATE_SPD_WORKER_STATE
+    _CREATE_SPD_WORKER_STATE = worker_state
+
+
+def _process_single_frame_worker(data_info):
+    """Top-level worker for ProcessPoolExecutor. Reads state from _CREATE_SPD_WORKER_STATE."""
+    s = _CREATE_SPD_WORKER_STATE
+    if s is None:
+        raise RuntimeError("Worker state not initialized")
+    root_path = s['root_path']
+    v2x_side = s['v2x_side']
+    sample_info_mappings = s['sample_info_mappings']
+    lidar_ego_global_infos = s['lidar_ego_global_infos']
+    data_infos_mapping = s['data_infos_mapping']
+    total_annotations = s['total_annotations']
+    instance_token_mappings = s['instance_token_mappings']
+    visibility_mappings = s['visibility_mappings']
+    max_sweeps = s['max_sweeps']
+    forecasting = s['forecasting']
+    forecasting_length = s['forecasting_length']
+
+    sample_token = data_info['frame_id']
+    sample_info = sample_info_mappings[sample_token]
+    info = {
+        'token': sample_info['token'],
+        'frame_idx': sample_info['frame_idx'],
+        'scene_token': sample_info['scene_token'],
+        'location': sample_info['location'],
+        'timestamp': sample_info['timestamp'],
+        'prev': sample_info['prev'],
+        'next': sample_info['next'],
+    }
+
+    info['lidar_path'] = data_info['pointcloud_path'].replace('pcd', 'bin')
+    info['lidar2ego_rotation'] = lidar_ego_global_infos[sample_token]['lidar2ego_rotation']
+    info['lidar2ego_translation'] = lidar_ego_global_infos[sample_token]['lidar2ego_translation']
+    info['ego2global_rotation'] = lidar_ego_global_infos[sample_token]['ego2global_rotation']
+    info['ego2global_translation'] = lidar_ego_global_infos[sample_token]['ego2global_translation']
+
+    camera_type = 'VEHICLE_CAM_FRONT'
+    info['cams'] = {camera_type: {}}
+    info['cams'][camera_type]['data_path'] = data_info['image_path']
+
+    key_calib = 'calib_virtuallidar_to_camera_path' if v2x_side == 'infrastructure-side' else 'calib_lidar_to_camera_path'
+    calib_lidar2cam_path = osp.join(root_path, data_info[key_calib])
+    calib_lidar2cam = load_json(calib_lidar2cam_path)
+
+    info['cams'][camera_type]['lidar2cam_rotation'] = np.array(calib_lidar2cam['rotation'])
+    info['cams'][camera_type]['lidar2cam_translation'] = np.array(calib_lidar2cam['translation'])
+    cam2lidar_r = np.linalg.inv(calib_lidar2cam['rotation'])
+    cam2lidar_t = -np.array(calib_lidar2cam['translation']).reshape(1, 3) @ cam2lidar_r.T
+    info['cams'][camera_type]['sensor2lidar_rotation'] = cam2lidar_r
+    info['cams'][camera_type]['sensor2lidar_translation'] = cam2lidar_t.reshape(3)
+    cam2ego_r, cam2ego_t = mul_matrix(
+        cam2lidar_r, cam2lidar_t,
+        Quaternion(info['lidar2ego_rotation']).rotation_matrix,
+        np.array(info['lidar2ego_translation']))
+    info['cams'][camera_type]['sensor2ego_rotation'] = cam2ego_r
+    info['cams'][camera_type]['sensor2ego_translation'] = cam2ego_t.reshape(3)
+
+    calib_cam_intrinsic_path = osp.join(root_path, data_info['calib_camera_intrinsic_path'])
+    info['cams'][camera_type]['cam_intrinsic'] = get_cam_intr(calib_cam_intrinsic_path)
+
+    info['sweeps'] = generate_sweeps(sample_token, sample_info_mappings, data_infos_mapping, max_sweeps=max_sweeps)
+    info['can_bus'] = process_can_bus(info['ego2global_translation'], info['ego2global_rotation'])
+
+    annotations = total_annotations[sample_token]
+    boxes = []
+    for anno_token, annotation in annotations.items():
+        box3d = Box3D()
+        box3d.center = [annotation['3d_location']['x'], annotation['3d_location']['y'], annotation['3d_location']['z']]
+        box3d.wlh = [annotation['3d_dimensions']['w'], annotation['3d_dimensions']['l'], annotation['3d_dimensions']['h']]
+        box3d.orientation_yaw_pitch_roll = annotation['rotation']
+        box3d.name = annotation['type']
+        box3d.token = annotation['token']
+        box3d.instance_token = annotation['instance_token']
+        box3d.track_id = int(annotation['track_id'])
+        box3d.timestamp = float(sample_info['timestamp'])
+        box3d.visibility = visibility_mappings[annotation['occluded_state']]
+        box3d.gt_velocity = annotation['gt_velocity']
+        box3d.prev = annotation['prev']
+        box3d.next = annotation['next']
+        boxes.append(box3d)
+
+    locs = np.array([b.center for b in boxes]).reshape(-1, 3)
+    dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
+    rots = np.array([b.orientation_yaw_pitch_roll for b in boxes]).reshape(-1, 1)
+    info['gt_boxes'] = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
+    info['gt_names'] = np.array([b.name for b in boxes])
+    info['gt_ins_tokens'] = np.array([b.instance_token for b in boxes])
+    info['gt_inds'] = np.array([b.track_id for b in boxes])
+    info['anno_tokens'] = np.array([b.token for b in boxes])
+    info['timestamps'] = np.array([b.timestamp for b in boxes])
+    info['visibility_tokens'] = np.array([b.visibility for b in boxes])
+    info['gt_velocity'] = np.array([b.gt_velocity for b in boxes])
+    info['prev_anno_tokens'] = np.array([b.prev for b in boxes])
+    info['next_anno_tokens'] = np.array([b.next for b in boxes])
+
+    lidar_file = osp.join(root_path, info['lidar_path'])
+    if len(info['gt_boxes']) > 0:
+        num_lidar_pts = compute_num_lidar_pts_per_box(lidar_file, info['gt_boxes'], load_dim=4)
+        valid_flag = num_lidar_pts > 0
+    else:
+        num_lidar_pts = np.zeros((0,), dtype=np.int64)
+        valid_flag = np.zeros((0,), dtype=bool)
+    info['num_lidar_pts'] = num_lidar_pts
+    info['valid_flag'] = valid_flag
+
+    attributes, attribute_tokens = [], []
+    for name, vel, vis, valid in zip(info['gt_names'], info['gt_velocity'], info['visibility_tokens'], info['valid_flag']):
+        attr = infer_nuscenes_attribute(name, vel, vis, valid)
+        if attr is None:
+            attributes.append('None')
+            attribute_tokens.append(-1)
+        else:
+            attributes.append(attr)
+            attribute_tokens.append(ATTRIBUTE_MAPPING[attr])
+    info['gt_attributes'] = np.array(attributes, dtype=object)
+    info['gt_attribute_tokens'] = np.array(attribute_tokens, dtype=np.int64)
+
+    if forecasting:
+        fboxes, fannotations, fmasks, ftypes = get_forecasting_annotations(
+            instance_token_mappings, lidar_ego_global_infos, annotations, forecasting_length)
+        info['forecasting_locs'] = np.array([np.array([b.center for b in fb]).reshape(-1, 3) for fb in fboxes])
+        info['forecasting_tokens'] = np.array([np.array([b.token for b in fb]) for fb in fboxes])
+        info['forecasting_masks'] = np.array(fmasks)
+        info['forecasting_types'] = np.array(ftypes)
+
+    return info
+
+
+# Worker state for create_spd_infos_coop (ProcessPoolExecutor)
+_CREATE_SPD_COOP_WORKER_STATE = None
+
+
+def _init_create_spd_coop_worker(worker_state):
+    """Set shared state for create_spd_infos_coop workers (called once per process)."""
+    global _CREATE_SPD_COOP_WORKER_STATE
+    _CREATE_SPD_COOP_WORKER_STATE = worker_state
+
+
+def _process_single_frame_coop_worker(coop_data_info):
+    """Top-level worker for create_spd_infos_coop ProcessPoolExecutor."""
+    s = _CREATE_SPD_COOP_WORKER_STATE
+    if s is None:
+        raise RuntimeError("Coop worker state not initialized")
+    root_path = s['root_path']
+    sample_info_mappings = s['sample_info_mappings']
+    lidar_ego_global_infos = s['lidar_ego_global_infos']
+    veh_map = s['veh_map']
+    inf_map = s['inf_map']
+    sweep_data_mapping = s['sweep_data_mapping']
+    total_annotations = s['total_annotations']
+    instance_token_mappings = s['instance_token_mappings']
+    visibility_mappings = s['visibility_mappings']
+    max_sweeps = s['max_sweeps']
+    forecasting = s['forecasting']
+    forecasting_length = s['forecasting_length']
+
+    veh_frame_id = coop_data_info['vehicle_frame']
+    inf_frame_id = coop_data_info['infrastructure_frame']
+    sample_token = veh_frame_id
+    sample_info = sample_info_mappings[sample_token]
+
+    info = dict(
+        token=sample_info['token'],
+        frame_idx=sample_info['frame_idx'],
+        scene_token=sample_info['scene_token'],
+        location=sample_info['location'],
+        timestamp=sample_info['timestamp'],
+        prev=sample_info['prev'],
+        next=sample_info['next'],
+        token_inf=sample_info['token_inf'],
+        timestamp_inf=sample_info['timestamp_inf'],
+        system_error_offset=sample_info['system_error_offset']
+    )
+
+    veh_data_info = veh_map[veh_frame_id]
+    inf_data_info = inf_map[inf_frame_id]
+
+    info['lidar_path'] = veh_data_info['pointcloud_path'].replace('pcd', 'bin')
+    info['lidar2ego_rotation'] = lidar_ego_global_infos[sample_token]['lidar2ego_rotation']
+    info['lidar2ego_translation'] = lidar_ego_global_infos[sample_token]['lidar2ego_translation']
+    info['ego2global_rotation'] = lidar_ego_global_infos[sample_token]['ego2global_rotation']
+    info['ego2global_translation'] = lidar_ego_global_infos[sample_token]['ego2global_translation']
+
+    # Infrastructure (ego = virtuallidar)
+    info['lidar2ego_rotation_inf'] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    info['lidar2ego_translation_inf'] = np.zeros(3, dtype=np.float32)
+    calib_vl2g = load_json(osp.join(
+        root_path, 'infrastructure-side',
+        inf_data_info['calib_virtuallidar_to_world_path']))
+    virtuallidar2world_r = np.array(calib_vl2g['rotation']).reshape(3, 3)
+    virtuallidar2world_r = orthonormalize_rotation(virtuallidar2world_r)
+    try:
+        q_inf = Quaternion(matrix=virtuallidar2world_r)
+    except ValueError:
+        virtuallidar2world_r = iterative_closest_point(virtuallidar2world_r.astype(np.float64))
+        q_inf = Quaternion(matrix=virtuallidar2world_r)
+    info['ego2global_rotation_inf'] = np.array([q_inf.w, q_inf.x, q_inf.y, q_inf.z], dtype=np.float32)
+    info['ego2global_translation_inf'] = np.array(calib_vl2g['translation'], dtype=np.float32).reshape(3)
+
+    # VehLidar2InfLidar (coop coordinate transform)
+    veh_l2e_r = np.array(Quaternion(info['lidar2ego_rotation']).rotation_matrix)
+    veh_l2e_t = np.array(info['lidar2ego_translation']).reshape(3)
+    veh_e2g_r = np.array(Quaternion(info['ego2global_rotation']).rotation_matrix)
+    veh_e2g_t = np.array(info['ego2global_translation']).reshape(3)
+    inf_e2g_r = np.array(calib_vl2g['rotation']).reshape(3, 3)
+    inf_e2g_t = np.array(calib_vl2g['translation']).reshape(3)
+    inf_l2e_r = np.eye(3)
+    inf_l2e_t = np.zeros(3)
+    err_offset = np.array([
+        sample_info['system_error_offset']['delta_x'],
+        sample_info['system_error_offset']['delta_y'], 0])
+    r = ((veh_l2e_r.T @ veh_e2g_r.T) @
+         (np.linalg.inv(inf_e2g_r).T @ np.linalg.inv(inf_l2e_r).T)).T
+    t = (-err_offset @ veh_l2e_r.T @ veh_e2g_r.T + veh_l2e_t @ veh_e2g_r.T +
+         veh_e2g_t) @ (np.linalg.inv(inf_e2g_r).T @ np.linalg.inv(inf_l2e_r).T)
+    t -= inf_e2g_t @ (np.linalg.inv(inf_e2g_r).T @ np.linalg.inv(inf_l2e_r).T) + inf_l2e_t @ (np.linalg.inv(inf_l2e_r).T)
+    info['VehLidar2InfLidar_rotation'] = r
+    info['VehLidar2InfLidar_translation'] = t
+
+    # Camera
+    camera_type = 'VEHICLE_CAM_FRONT'
+    info['cams'] = {camera_type: {}}
+    info['cams'][camera_type]['data_path'] = veh_data_info['image_path']
+    calib_l2c = load_json(osp.join(
+        root_path, 'vehicle-side',
+        veh_data_info['calib_lidar_to_camera_path']))
+    info['cams'][camera_type]['lidar2cam_rotation'] = np.array(calib_l2c['rotation'])
+    info['cams'][camera_type]['lidar2cam_translation'] = np.array(calib_l2c['translation'])
+    cam2lidar_r = np.linalg.inv(calib_l2c['rotation'])
+    cam2lidar_t = -np.array(calib_l2c['translation']).reshape(1, 3) @ cam2lidar_r.T
+    info['cams'][camera_type]['sensor2lidar_rotation'] = cam2lidar_r
+    info['cams'][camera_type]['sensor2lidar_translation'] = cam2lidar_t.reshape(3)
+    cam2ego_r, cam2ego_t = mul_matrix(
+        cam2lidar_r, cam2lidar_t,
+        Quaternion(info['lidar2ego_rotation']).rotation_matrix,
+        np.array(info['lidar2ego_translation']))
+    info['cams'][camera_type]['sensor2ego_rotation'] = cam2ego_r
+    info['cams'][camera_type]['sensor2ego_translation'] = cam2ego_t.reshape(3)
+    info['cams'][camera_type]['cam_intrinsic'] = get_cam_intr(osp.join(
+        root_path, 'vehicle-side',
+        veh_data_info['calib_camera_intrinsic_path']))
+
+    info['sweeps'] = generate_sweeps(
+        sample_token, sample_info_mappings, sweep_data_mapping, max_sweeps=max_sweeps)
+    info['can_bus'] = process_can_bus(
+        info['ego2global_translation'], info['ego2global_rotation'])
+
+    annotations = total_annotations[sample_token]
+    boxes = []
+    for annotation in annotations.values():
+        box3d = Box3D()
+        box3d.center = [
+            annotation['3d_location']['x'],
+            annotation['3d_location']['y'],
+            annotation['3d_location']['z']
+        ]
+        box3d.wlh = [
+            annotation['3d_dimensions']['w'],
+            annotation['3d_dimensions']['l'],
+            annotation['3d_dimensions']['h']
+        ]
+        box3d.orientation_yaw_pitch_roll = annotation['rotation']
+        box3d.name = annotation['type']
+        box3d.token = annotation['token']
+        box3d.instance_token = annotation['instance_token']
+        box3d.track_id = int(annotation['track_id'])
+        box3d.timestamp = float(sample_info['timestamp'])
+        box3d.visibility = visibility_mappings[annotation['occluded_state']]
+        box3d.gt_velocity = annotation['gt_velocity']
+        box3d.prev = annotation['prev']
+        box3d.next = annotation['next']
+        boxes.append(box3d)
+
+    if len(boxes) > 0:
+        locs = np.array([b.center for b in boxes]).reshape(-1, 3)
+        dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
+        rots = np.array([b.orientation_yaw_pitch_roll for b in boxes]).reshape(-1, 1)
+        gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
+    else:
+        gt_boxes = np.zeros((0, 7))
+
+    full_lidar_path = osp.join(root_path, 'vehicle-side', info['lidar_path'])
+    if len(gt_boxes) > 0:
+        num_lidar_pts = compute_num_lidar_pts_per_box(full_lidar_path, gt_boxes, load_dim=4)
+        valid_flag = num_lidar_pts > 0
+    else:
+        num_lidar_pts = np.zeros((0,), dtype=np.int64)
+        valid_flag = np.zeros((0,), dtype=bool)
+
+    names = np.array([b.name for b in boxes])
+    visibility_tokens = np.array([b.visibility for b in boxes])
+    gt_velocity = np.array([b.gt_velocity for b in boxes])
+
+    attributes, attribute_tokens = [], []
+    for name, vel, vis, valid in zip(names, gt_velocity, visibility_tokens, valid_flag):
+        attr = infer_nuscenes_attribute(name, vel, vis, valid)
+        if attr is None:
+            attributes.append('None')
+            attribute_tokens.append(-1)
+        else:
+            attributes.append(attr)
+            attribute_tokens.append(ATTRIBUTE_MAPPING[attr])
+
+    info.update(dict(
+        gt_boxes=gt_boxes,
+        gt_names=names,
+        gt_velocity=gt_velocity,
+        visibility_tokens=visibility_tokens,
+        valid_flag=valid_flag,
+        num_lidar_pts=num_lidar_pts,
+        gt_attributes=np.array(attributes, dtype=object),
+        gt_attribute_tokens=np.array(attribute_tokens, dtype=np.int64),
+        gt_ins_tokens=np.array([b.instance_token for b in boxes]),
+        gt_inds=np.array([b.track_id for b in boxes]),
+        anno_tokens=np.array([b.token for b in boxes]),
+        timestamps=np.array([b.timestamp for b in boxes]),
+        prev_anno_tokens=np.array([b.prev for b in boxes]),
+        next_anno_tokens=np.array([b.next for b in boxes]),
+    ))
+
+    if forecasting:
+        fboxes, fannotations, fmasks, ftypes = get_forecasting_annotations(
+            instance_token_mappings,
+            lidar_ego_global_infos,
+            annotations,
+            forecasting_length)
+        locs = [np.array([b.center for b in fb]).reshape(-1, 3) for fb in fboxes]
+        tokens = [np.array([b.token for b in fb]) for fb in fboxes]
+        info['forecasting_locs'] = np.array(locs)
+        info['forecasting_tokens'] = np.array(tokens)
+        info['forecasting_masks'] = np.array(fmasks)
+        info['forecasting_types'] = np.array(ftypes)
+
+    return info
+
+
+def _get_total_annotations_coop(root_path, data_infos, sample_info_mappings, max_workers=None):
+    if max_workers is None:
+        max_workers = THREAD_POOL_IO_WORKERS
 
     def load_single_annotation(coop_data):
         veh_fid = coop_data['vehicle_frame']
@@ -1171,7 +1542,7 @@ def _get_total_annotations_coop(root_path, data_infos, sample_info_mappings, max
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(load_single_annotation, d)
                    for d in data_infos]
-        for f in tqdm(futures, desc="Loading coop annotations"):
+        for f in tqdm(as_completed(futures), total=len(futures), desc="Loading coop annotations"):
             veh_fid, ann_dict = f.result()
             total_annotations[veh_fid] = ann_dict
 
@@ -1189,7 +1560,7 @@ def create_spd_infos(root_path,
                      flag_save=True,
                      forecasting=False,
                      forecasting_length=13,
-                     max_workers=8):
+                     max_workers=None):
     """
     Multi-process accelerated version of SPD info creation
     """
@@ -1231,165 +1602,33 @@ def create_spd_infos(root_path,
     total_annotations, instance_token_mappings = _add_annotation_velocity_prev_next(
         total_annotations, instance_token_mappings, lidar_ego_global_infos)
 
+    # Precompute once
+    data_infos_mapping = _build_sweep_data_mapping(data_infos, lidar_ego_global_infos)
+
     # ---------------------------------------------------------------------
-    # Define single-frame processing function inside
+    # ProcessPoolExecutor: true multi-process (bypass GIL), state via initializer
     # ---------------------------------------------------------------------
-    def process_single_frame(data_info):
-        sample_token = data_info['frame_id']
-        sample_info = sample_info_mappings[sample_token]
-        info = {
-            'token': sample_info['token'],
-            'frame_idx': sample_info['frame_idx'],
-            'scene_token': sample_info['scene_token'],
-            'location': sample_info['location'],
-            'timestamp': sample_info['timestamp'],
-            'prev': sample_info['prev'],
-            'next': sample_info['next'],
-        }
+    if max_workers is None:
+        max_workers = CREATE_SPD_INFOS_WORKERS
 
-        # LiDAR path
-        info['lidar_path'] = data_info['pointcloud_path'].replace('pcd', 'bin')
-        info['lidar2ego_rotation'] = lidar_ego_global_infos[sample_token]['lidar2ego_rotation']
-        info['lidar2ego_translation'] = lidar_ego_global_infos[sample_token]['lidar2ego_translation']
-        info['ego2global_rotation'] = lidar_ego_global_infos[sample_token]['ego2global_rotation']
-        info['ego2global_translation'] = lidar_ego_global_infos[sample_token]['ego2global_translation']
+    worker_state = {
+        'root_path': root_path,
+        'v2x_side': v2x_side,
+        'sample_info_mappings': sample_info_mappings,
+        'lidar_ego_global_infos': lidar_ego_global_infos,
+        'data_infos_mapping': data_infos_mapping,
+        'total_annotations': total_annotations,
+        'instance_token_mappings': instance_token_mappings,
+        'visibility_mappings': visibility_mappings,
+        'max_sweeps': max_sweeps,
+        'forecasting': forecasting,
+        'forecasting_length': forecasting_length,
+    }
 
-        # Camera info
-        camera_type = 'VEHICLE_CAM_FRONT'
-        info['cams'] = {camera_type: {}}
-        info['cams'][camera_type]['data_path'] = data_info['image_path']
-
-        key_calib_lidar2cam = 'calib_lidar_to_camera_path'
-        if v2x_side == 'infrastructure-side':
-            key_calib_lidar2cam = 'calib_virtuallidar_to_camera_path'
-        calib_lidar2cam_path = osp.join(
-            root_path, data_info[key_calib_lidar2cam])
-        calib_lidar2cam = load_json(calib_lidar2cam_path)
-
-        info['cams'][camera_type]['lidar2cam_rotation'] = np.array(
-            calib_lidar2cam['rotation'])
-        info['cams'][camera_type]['lidar2cam_translation'] = np.array(
-            calib_lidar2cam['translation'])
-
-        # sensor2lidar & sensor2ego
-        cam2lidar_r = np.linalg.inv(calib_lidar2cam['rotation'])
-        cam2lidar_t = - \
-            np.array(calib_lidar2cam['translation']
-                     ).reshape(1, 3) @ cam2lidar_r.T
-        info['cams'][camera_type]['sensor2lidar_rotation'] = cam2lidar_r
-        info['cams'][camera_type]['sensor2lidar_translation'] = cam2lidar_t.reshape(
-            3)
-        cam2ego_r, cam2ego_t = mul_matrix(cam2lidar_r, cam2lidar_t,
-                                          Quaternion(
-                                              info['lidar2ego_rotation']).rotation_matrix,
-                                          np.array(info['lidar2ego_translation']))
-        info['cams'][camera_type]['sensor2ego_rotation'] = cam2ego_r
-        info['cams'][camera_type]['sensor2ego_translation'] = cam2ego_t.reshape(
-            3)
-
-        calib_cam_intrinsic_path = osp.join(
-            root_path, data_info['calib_camera_intrinsic_path'])
-        info['cams'][camera_type]['cam_intrinsic'] = get_cam_intr(
-            calib_cam_intrinsic_path)
-
-        # sweeps
-        data_infos_mapping = _build_sweep_data_mapping(data_infos, lidar_ego_global_infos)
-        info['sweeps'] = generate_sweeps(
-            sample_token, sample_info_mappings, data_infos_mapping, max_sweeps=max_sweeps)
-
-        # can_bus
-        info['can_bus'] = process_can_bus(
-            info['ego2global_translation'], info['ego2global_rotation'])
-
-        # Annotations
-        annotations = total_annotations[sample_token]
-        boxes = []
-        for anno_token, annotation in annotations.items():
-            box3d = Box3D()
-            box3d.center = [annotation['3d_location']['x'],
-                            annotation['3d_location']['y'], annotation['3d_location']['z']]
-            box3d.wlh = [annotation['3d_dimensions']['w'],
-                         annotation['3d_dimensions']['l'], annotation['3d_dimensions']['h']]
-            box3d.orientation_yaw_pitch_roll = annotation['rotation']
-            box3d.name = annotation['type']
-            box3d.token = annotation['token']
-            box3d.instance_token = annotation['instance_token']
-            box3d.track_id = int(annotation['track_id'])
-            box3d.timestamp = float(sample_info['timestamp'])
-            box3d.visibility = visibility_mappings[annotation['occluded_state']]
-            box3d.gt_velocity = annotation['gt_velocity']
-            box3d.prev = annotation['prev']
-            box3d.next = annotation['next']
-            boxes.append(box3d)
-
-        locs = np.array([b.center for b in boxes]).reshape(-1, 3)
-        dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
-        rots = np.array(
-            [b.orientation_yaw_pitch_roll for b in boxes]).reshape(-1, 1)
-        info['gt_boxes'] = np.concatenate(
-            [locs, dims, -rots - np.pi / 2], axis=1)
-        info['gt_names'] = np.array([b.name for b in boxes])
-        info['gt_ins_tokens'] = np.array([b.instance_token for b in boxes])
-        info['gt_inds'] = np.array([b.track_id for b in boxes])
-        info['anno_tokens'] = np.array([b.token for b in boxes])
-        info['timestamps'] = np.array([b.timestamp for b in boxes])
-        info['visibility_tokens'] = np.array([b.visibility for b in boxes])
-        info['gt_velocity'] = np.array([b.gt_velocity for b in boxes])
-        info['prev_anno_tokens'] = np.array([b.prev for b in boxes])
-        info['next_anno_tokens'] = np.array([b.next for b in boxes])
-        lidar_file = osp.join(root_path, info['lidar_path'])
-
-        if len(info['gt_boxes']) > 0:
-            num_lidar_pts = compute_num_lidar_pts_per_box(
-                lidar_file,
-                info['gt_boxes'],
-                load_dim=4
-            )
-            valid_flag = num_lidar_pts > 0
-        else:
-            num_lidar_pts = np.zeros((0,), dtype=np.int64)
-            valid_flag = np.zeros((0,), dtype=bool)
-        info['num_lidar_pts'] = num_lidar_pts
-        info['valid_flag'] = valid_flag
-
-        attributes = []
-        attribute_tokens = []
-        for name, vel, vis, valid in zip(
-                info['gt_names'],
-                info['gt_velocity'],
-                info['visibility_tokens'],
-                info['valid_flag']
-        ):
-            attr = infer_nuscenes_attribute(name, vel, vis, valid)
-            if attr is None:
-                attributes.append('None')
-                attribute_tokens.append(-1)
-            else:
-                attributes.append(attr)
-                attribute_tokens.append(ATTRIBUTE_MAPPING[attr])
-        info['gt_attributes'] = np.array(attributes, dtype=object)
-        info['gt_attribute_tokens'] = np.array(attribute_tokens, dtype=np.int64)
-
-        # Forecasting
-        if forecasting:
-            fboxes, fannotations, fmasks, ftypes = get_forecasting_annotations(
-                instance_token_mappings, lidar_ego_global_infos, annotations, forecasting_length)
-            info['forecasting_locs'] = np.array(
-                [np.array([b.center for b in boxes]).reshape(-1, 3) for boxes in fboxes])
-            info['forecasting_tokens'] = np.array(
-                [np.array([b.token for b in boxes]) for boxes in fboxes])
-            info['forecasting_masks'] = np.array(fmasks)
-            info['forecasting_types'] = np.array(ftypes)
-
-        return info
-    # ---------------------------------------------------------------------
-    # Multi-process execution
-    # ---------------------------------------------------------------------
     spd_infos = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_single_frame, data_info)
-                   for data_info in data_infos]
-        for fut in tqdm(as_completed(futures), total=len(futures)):
+    with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_create_spd_worker, initargs=(worker_state,)) as executor:
+        futures = [executor.submit(_process_single_frame_worker, data_info) for data_info in data_infos]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="create_spd_infos"):
             spd_infos.append(fut.result())
 
     # Split train / val
@@ -1421,7 +1660,7 @@ def create_spd_infos_coop(root_path,
                           flag_save=True,
                           forecasting=False,
                           forecasting_length=13,
-                          max_workers=8):
+                          max_workers=None):
 
     out_path = osp.join(out_path, v2x_side)
 
@@ -1483,233 +1722,37 @@ def create_spd_infos_coop(root_path,
             instance_token_mappings,
             lidar_ego_global_infos)
 
-    # 预索引（性能优化）
+    # 预索引
     veh_map = {d['frame_id']: d for d in veh_data_infos}
     inf_map = {d['frame_id']: d for d in inf_data_infos}
-    sweep_data_mapping = _build_sweep_data_mapping(veh_data_infos, lidar_ego_global_infos)
+    sweep_data_mapping = _build_sweep_data_mapping(
+        veh_data_infos, lidar_ego_global_infos)
 
     # ===============================
-    # 单帧处理函数
+    # ProcessPoolExecutor (与 single 一致，避免 pickle 闭包)
     # ===============================
+    if max_workers is None:
+        max_workers = CREATE_SPD_INFOS_WORKERS
 
-    def process_single_frame(coop_data_info):
-
-        veh_frame_id = coop_data_info['vehicle_frame']
-        inf_frame_id = coop_data_info['infrastructure_frame']
-        sample_token = veh_frame_id
-        sample_info = sample_info_mappings[sample_token]
-
-        info = dict(
-            token=sample_info['token'],
-            frame_idx=sample_info['frame_idx'],
-            scene_token=sample_info['scene_token'],
-            location=sample_info['location'],
-            timestamp=sample_info['timestamp'],
-            prev=sample_info['prev'],
-            next=sample_info['next'],
-            token_inf=sample_info['token_inf'],
-            timestamp_inf=sample_info['timestamp_inf'],
-            system_error_offset=sample_info['system_error_offset']
-        )
-
-        veh_data_info = veh_map[veh_frame_id]
-        inf_data_info = inf_map[inf_frame_id]
-
-        info['lidar_path'] = veh_data_info['pointcloud_path'].replace('pcd', 'bin')
-
-        info['lidar2ego_rotation'] = lidar_ego_global_infos[sample_token]['lidar2ego_rotation']
-        info['lidar2ego_translation'] = lidar_ego_global_infos[sample_token]['lidar2ego_translation']
-        info['ego2global_rotation'] = lidar_ego_global_infos[sample_token]['ego2global_rotation']
-        info['ego2global_translation'] = lidar_ego_global_infos[sample_token]['ego2global_translation']
-
-        # Infrastructure (ego = virtuallidar)
-        info['lidar2ego_rotation_inf'] = np.array(
-            [1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        info['lidar2ego_translation_inf'] = np.zeros(3, dtype=np.float32)
-        calib_vl2g = load_json(osp.join(
-            root_path, 'infrastructure-side',
-            inf_data_info['calib_virtuallidar_to_world_path']))
-        virtuallidar2world_r = np.array(calib_vl2g['rotation'])
-        approx_r = orthonormalize_rotation(virtuallidar2world_r)
-        q_inf = Quaternion(matrix=approx_r)
-        info['ego2global_rotation_inf'] = np.array(
-            [q_inf.w, q_inf.x, q_inf.y, q_inf.z], dtype=np.float32)
-        info['ego2global_translation_inf'] = np.array(
-            calib_vl2g['translation'], dtype=np.float32).reshape(3)
-
-        # VehLidar2InfLidar (coop coordinate transform)
-        veh_l2e_r = np.array(Quaternion(info['lidar2ego_rotation']).rotation_matrix)
-        veh_l2e_t = np.array(info['lidar2ego_translation']).reshape(3)
-        veh_e2g_r = np.array(Quaternion(info['ego2global_rotation']).rotation_matrix)
-        veh_e2g_t = np.array(info['ego2global_translation']).reshape(3)
-        inf_e2g_r = np.array(calib_vl2g['rotation'])
-        inf_e2g_t = np.array(calib_vl2g['translation']).reshape(3)
-        inf_l2e_r = np.eye(3)
-        inf_l2e_t = np.zeros(3)
-        err_offset = np.array([
-            sample_info['system_error_offset']['delta_x'],
-            sample_info['system_error_offset']['delta_y'], 0])
-        r = ((veh_l2e_r.T @ veh_e2g_r.T) @ (np.linalg.inv(inf_e2g_r).T @ np.linalg.inv(inf_l2e_r).T)).T
-        t = (-err_offset @ veh_l2e_r.T @ veh_e2g_r.T + veh_l2e_t @ veh_e2g_r.T + veh_e2g_t) @ (np.linalg.inv(inf_e2g_r).T @ np.linalg.inv(inf_l2e_r).T)
-        t -= inf_e2g_t @ (np.linalg.inv(inf_e2g_r).T @ np.linalg.inv(inf_l2e_r).T) + inf_l2e_t @ (np.linalg.inv(inf_l2e_r).T)
-        info['VehLidar2InfLidar_rotation'] = r
-        info['VehLidar2InfLidar_translation'] = t
-
-        # Camera
-        camera_type = 'VEHICLE_CAM_FRONT'
-        info['cams'] = {camera_type: {}}
-        info['cams'][camera_type]['data_path'] = veh_data_info['image_path']
-        calib_l2c = load_json(osp.join(
-            root_path, 'vehicle-side',
-            veh_data_info['calib_lidar_to_camera_path']))
-        info['cams'][camera_type]['lidar2cam_rotation'] = np.array(calib_l2c['rotation'])
-        info['cams'][camera_type]['lidar2cam_translation'] = np.array(calib_l2c['translation'])
-        cam2lidar_r = np.linalg.inv(calib_l2c['rotation'])
-        cam2lidar_t = -np.array(calib_l2c['translation']).reshape(1, 3) @ cam2lidar_r.T
-        info['cams'][camera_type]['sensor2lidar_rotation'] = cam2lidar_r
-        info['cams'][camera_type]['sensor2lidar_translation'] = cam2lidar_t.reshape(3)
-        cam2ego_r, cam2ego_t = mul_matrix(
-            cam2lidar_r, cam2lidar_t,
-            Quaternion(info['lidar2ego_rotation']).rotation_matrix,
-            np.array(info['lidar2ego_translation']))
-        info['cams'][camera_type]['sensor2ego_rotation'] = cam2ego_r
-        info['cams'][camera_type]['sensor2ego_translation'] = cam2ego_t.reshape(3)
-        info['cams'][camera_type]['cam_intrinsic'] = get_cam_intr(osp.join(
-            root_path, 'vehicle-side',
-            veh_data_info['calib_camera_intrinsic_path']))
-
-        # sweeps
-        info['sweeps'] = generate_sweeps(
-            sample_token, sample_info_mappings, sweep_data_mapping, max_sweeps=max_sweeps)
-
-        # can_bus
-        info['can_bus'] = process_can_bus(
-            info['ego2global_translation'], info['ego2global_rotation'])
-
-        # ===============================
-        # Annotations
-        # ===============================
-
-        annotations = total_annotations[sample_token]
-
-        boxes = []
-        for annotation in annotations.values():
-            box3d = Box3D()
-            box3d.center = [
-                annotation['3d_location']['x'],
-                annotation['3d_location']['y'],
-                annotation['3d_location']['z']
-            ]
-            box3d.wlh = [
-                annotation['3d_dimensions']['w'],
-                annotation['3d_dimensions']['l'],
-                annotation['3d_dimensions']['h']
-            ]
-            box3d.orientation_yaw_pitch_roll = annotation['rotation']
-            box3d.name = annotation['type']
-            box3d.token = annotation['token']
-            box3d.instance_token = annotation['instance_token']
-            box3d.track_id = int(annotation['track_id'])
-            box3d.timestamp = float(sample_info['timestamp'])
-            box3d.visibility = visibility_mappings[annotation['occluded_state']]
-            box3d.gt_velocity = annotation['gt_velocity']
-            box3d.prev = annotation['prev']
-            box3d.next = annotation['next']
-            boxes.append(box3d)
-
-        if len(boxes) > 0:
-            locs = np.array([b.center for b in boxes]).reshape(-1, 3)
-            dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
-            rots = np.array(
-                [b.orientation_yaw_pitch_roll for b in boxes]).reshape(-1, 1)
-            gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
-        else:
-            gt_boxes = np.zeros((0, 7))
-
-        full_lidar_path = osp.join(
-            root_path, 'vehicle-side', info['lidar_path'])
-
-        if len(gt_boxes) > 0:
-            num_lidar_pts = compute_num_lidar_pts_per_box(
-                full_lidar_path, gt_boxes, load_dim=4)
-            valid_flag = num_lidar_pts > 0
-        else:
-            num_lidar_pts = np.zeros((0,), dtype=np.int64)
-            valid_flag = np.zeros((0,), dtype=bool)
-
-        names = np.array([b.name for b in boxes])
-        visibility_tokens = np.array([b.visibility for b in boxes])
-        gt_velocity = np.array([b.gt_velocity for b in boxes])
-
-        attributes = []
-        attribute_tokens = []
-
-        for name, vel, vis, valid in zip(
-                names, gt_velocity, visibility_tokens, valid_flag):
-
-            attr = infer_nuscenes_attribute(name, vel, vis, valid)
-            if attr is None:
-                attributes.append('None')
-                attribute_tokens.append(-1)
-            else:
-                attributes.append(attr)
-                attribute_tokens.append(ATTRIBUTE_MAPPING[attr])
-
-        info.update(dict(
-            gt_boxes=gt_boxes,
-            gt_names=names,
-            gt_velocity=gt_velocity,
-            visibility_tokens=visibility_tokens,
-            valid_flag=valid_flag,
-            num_lidar_pts=num_lidar_pts,
-            gt_attributes=np.array(attributes, dtype=object),
-            gt_attribute_tokens=np.array(attribute_tokens, dtype=np.int64),
-            gt_ins_tokens=np.array([b.instance_token for b in boxes]),
-            gt_inds=np.array([b.track_id for b in boxes]),
-            anno_tokens=np.array([b.token for b in boxes]),
-            timestamps=np.array([b.timestamp for b in boxes]),
-            prev_anno_tokens=np.array([b.prev for b in boxes]),
-            next_anno_tokens=np.array([b.next for b in boxes]),
-        ))
-
-        # ===============================
-        # Forecasting
-        # ===============================
-
-        if forecasting:
-            fboxes, fannotations, fmasks, ftypes = get_forecasting_annotations(
-                instance_token_mappings,
-                lidar_ego_global_infos,
-                annotations,
-                forecasting_length)
-
-            locs = [
-                np.array([b.center for b in fb]).reshape(-1, 3)
-                for fb in fboxes
-            ]
-            tokens = [
-                np.array([b.token for b in fb])
-                for fb in fboxes
-            ]
-
-            info['forecasting_locs'] = np.array(locs)
-            info['forecasting_tokens'] = np.array(tokens)
-            info['forecasting_masks'] = np.array(fmasks)
-            info['forecasting_types'] = np.array(ftypes)
-
-        return info
-
-    # ===============================
-    # Multi-process
-    # ===============================
+    coop_worker_state = {
+        'root_path': root_path,
+        'sample_info_mappings': sample_info_mappings,
+        'lidar_ego_global_infos': lidar_ego_global_infos,
+        'veh_map': veh_map,
+        'inf_map': inf_map,
+        'sweep_data_mapping': sweep_data_mapping,
+        'total_annotations': total_annotations,
+        'instance_token_mappings': instance_token_mappings,
+        'visibility_mappings': visibility_mappings,
+        'max_sweeps': max_sweeps,
+        'forecasting': forecasting,
+        'forecasting_length': forecasting_length,
+    }
 
     spd_infos = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(process_single_frame, d)
-            for d in coop_data_infos
-        ]
-        for fut in tqdm(as_completed(futures), total=len(futures)):
+    with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_create_spd_coop_worker, initargs=(coop_worker_state,)) as executor:
+        futures = [executor.submit(_process_single_frame_coop_worker, d) for d in coop_data_infos]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="create_spd_infos_coop"):
             spd_infos.append(fut.result())
 
     train_spd_infos = [
@@ -1752,6 +1795,8 @@ def parse_args():
     parser.add_argument('--info-prefix', type=str, default="spd")
     parser.add_argument('--forecasting', action='store_true',
                         default=False, help='prepare trajectory forecasting data')
+    parser.add_argument('--max-workers', type=int, default=None,
+                        help='Process workers for create_spd_infos (default: CREATE_SPD_INFOS_WORKERS)')
 
     args = parser.parse_args()
     return args
@@ -1788,7 +1833,7 @@ if __name__ == "__main__":
             version=args.version,
             max_sweeps=10,
             forecasting=forecasting,
-            max_workers=NUM_PROCESSES)
+            max_workers=args.max_workers)
     else:
         # generate_json_maps_files(data_root, version=v2x_side)
         total_annotations, sample_info_mappings, spd_infos = create_spd_infos(
@@ -1800,4 +1845,4 @@ if __name__ == "__main__":
             version=args.version,
             max_sweeps=10,
             forecasting=forecasting,
-            max_workers=NUM_PROCESSES)
+            max_workers=args.max_workers)

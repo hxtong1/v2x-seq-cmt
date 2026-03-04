@@ -47,7 +47,7 @@ def get_forecasting_annotations(instance_token_mappings,
                       size = [annotation['3d_dimensions']['w'], annotation['3d_dimensions']['l'],
                               annotation['3d_dimensions']['h']],
                       orientation = Quaternion(axis=[0, 0, 1], radians=annotation['rotation']),
-                      velocity = annotation['gt_velocity'].tolist() + [0], # x, y, and pad 0 for z
+                      velocity = (np.asarray(annotation['gt_velocity']).tolist())[:2] + [0],  # x, y, pad 0 for z
                       name = annotation["type"],
                       token = annotation["token"])
             

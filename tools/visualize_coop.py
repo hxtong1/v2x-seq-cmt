@@ -195,6 +195,58 @@ def limit_period(val):
     return (val + np.pi) % (2 * np.pi) - np.pi
 
 
+def _load_original_lidar_labels(data_root, frame_id):
+    """
+    加载原始 lidar 标注 JSON（vehicle-side/label/lidar/{frame_id}.json）。
+    返回 annotations 列表，失败返回 None。
+    """
+    for prefix in ['vehicle-side', '']:
+        path = osp.join(data_root, prefix, 'label', 'lidar', f'{frame_id}.json')
+        if osp.isfile(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+    return None
+
+
+def _lidar_label_json_to_boxes(annotations):
+    """
+    将原始 label JSON 转为 (N, 7) box 格式：(x,y,z,w,l,h,yaw)，yaw 为 SECOND 约定 (-rot-pi/2)。
+    """
+    if not annotations:
+        return np.zeros((0, 7), dtype=np.float32)
+    boxes = []
+    for ann in annotations:
+        loc = ann['3d_location']
+        dim = ann['3d_dimensions']
+        rot = ann['rotation']  # 原始 yaw (rad)
+        x, y, z = loc['x'], loc['y'], loc['z']
+        w, l, h = dim['w'], dim['l'], dim['h']
+        yaw = -rot - np.pi / 2  # SECOND
+        boxes.append([x, y, z, w, l, h, yaw])
+    return np.array(boxes, dtype=np.float32)
+
+
+def _compute_num_pts_per_box(pts_xyz, boxes):
+    """计算每个 box 内的点云数量。boxes: (N,7) (x,y,z,w,l,h,yaw) SECOND 格式。"""
+    if len(boxes) == 0:
+        return np.array([], dtype=np.int64)
+    cx, cy, cz = boxes[:, 0], boxes[:, 1], boxes[:, 2]
+    w, l, h = boxes[:, 3], boxes[:, 4], boxes[:, 5]
+    yaw = boxes[:, 6]
+    cos_yaw = np.cos(-yaw)
+    sin_yaw = np.sin(-yaw)
+    dx = pts_xyz[:, 0] - cx[:, None]
+    dy = pts_xyz[:, 1] - cy[:, None]
+    dz = pts_xyz[:, 2] - cz[:, None]
+    local_x = cos_yaw[:, None] * dx + sin_yaw[:, None] * dy
+    local_y = -sin_yaw[:, None] * dx + cos_yaw[:, None] * dy
+    in_x = np.abs(local_x) <= (l / 2)[:, None]
+    in_y = np.abs(local_y) <= (w / 2)[:, None]
+    in_z = np.abs(dz) <= (h / 2)[:, None]
+    inside = in_x & in_y & in_z
+    return inside.sum(axis=1).astype(np.int64)
+
+
 def _points_lidar_to_img(pts_lidar, lidar2cam_r, lidar2cam_t, cam_intrinsic):
     """Project lidar points to image. pts_lidar (N,3), returns (N,2) uv, (N,) depth, (N,) valid."""
     pts_cam = (lidar2cam_r @ pts_lidar.T).T + np.array(lidar2cam_t).reshape(1, 3)
@@ -508,6 +560,92 @@ class SPDVisualizer:
             plt.show()
 
     # ===============================
+    # 原始 lidar 标注可视化（验证点云是否覆盖所有标注）
+    # ===============================
+
+    def visualize_bev_original_labels(self, pts, info, save_path=None):
+        """
+        加载原始 SPD 数据集 label（label/lidar/{frame_id}.json），在 BEV 上叠加显示。
+        与 pkl 中 nuScenes 转换后的 GT 不同，此处为转换前的原始 SPD 标注。
+        绿框=框内有点云，红框=框内无点云。
+        """
+        frame_id = info.get('token', info.get('frame_id', ''))
+        if not frame_id:
+            print("No frame_id/token in info, cannot load original labels.")
+            return
+
+        annos = _load_original_lidar_labels(self.data_root, frame_id)
+        if annos is None:
+            print(f"Original SPD label not found: {self.data_root}/.../label/lidar/{frame_id}.json")
+            return
+
+        boxes = _lidar_label_json_to_boxes(annos)
+        num_pts = _compute_num_pts_per_box(pts, boxes)
+        has_pts = num_pts > 0
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        ax.scatter(pts[:, 0], pts[:, 1], s=0.2, c='gray', alpha=0.5)
+
+        n_has, n_no = int(has_pts.sum()), int((~has_pts).sum())
+        for i, box in enumerate(boxes):
+            corners = self.box_to_corners(box)[:4, :2]
+            color = 'lime' if has_pts[i] else 'red'
+            poly = Polygon(corners, fill=False, edgecolor=color, linewidth=1.5)
+            ax.add_patch(poly)
+            if num_pts[i] > 0:
+                ax.text(box[0], box[1], str(num_pts[i]), fontsize=6, color='darkgreen')
+
+        ax.set_aspect('equal')
+        ax.set_xlim(-60, 60)
+        ax.set_ylim(-60, 60)
+        ax.set_xlabel('X (forward)')
+        ax.set_ylabel('Y (left)')
+        plt.title(f'原始 SPD label | 绿=有点云({n_has}) 红=无点云({n_no}) | 共{len(boxes)}个框')
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150)
+            plt.close()
+            print("Saved BEV original labels:", save_path)
+        else:
+            plt.show()
+
+    def visualize_bev_original_vs_gt(self, pts, info, save_path=None):
+        """
+        对比原始 lidar 标注与 pkl 中的 GT：青=原始标注，红=GT。用于检查转换是否一致。
+        """
+        frame_id = info.get('token', info.get('frame_id', ''))
+        annos = _load_original_lidar_labels(self.data_root, frame_id)
+        if annos is None:
+            print("Original label not found.")
+            return
+        boxes_orig = _lidar_label_json_to_boxes(annos)
+        boxes_gt = info.get('gt_boxes', np.zeros((0, 7)))
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        ax.scatter(pts[:, 0], pts[:, 1], s=0.2, c='gray', alpha=0.5)
+
+        for box in boxes_orig:
+            corners = self.box_to_corners(box)[:4, :2]
+            poly = Polygon(corners, fill=False, edgecolor='cyan', linewidth=1.5)
+            ax.add_patch(poly)
+        for box in boxes_gt:
+            corners = self.box_to_corners(box)[:4, :2]
+            poly = Polygon(corners, fill=False, edgecolor='red', linewidth=1.0, linestyle='--')
+            ax.add_patch(poly)
+
+        ax.set_aspect('equal')
+        ax.set_xlim(-60, 60)
+        ax.set_ylim(-60, 60)
+        plt.title(f'青=原始标注({len(boxes_orig)}) 红=GT({len(boxes_gt)})')
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150)
+            plt.close()
+            print("Saved BEV original vs GT:", save_path)
+        else:
+            plt.show()
+
+    # ===============================
     # 图像 + 点云/框投影（验证是否仅对图像区域标注）
     # ===============================
 
@@ -798,6 +936,7 @@ class SPDVisualizer:
             show_3d=False,
             show_bev_fov=False,
             show_image_proj=False,
+            show_spd_original_labels=False,
             analyze_fov=False,
             check_continuity=False,
             export_video=False,
@@ -842,6 +981,12 @@ class SPDVisualizer:
                 save_path=f"{pf}_image_proj.png" if pf else None
             )
 
+        if show_spd_original_labels:
+            self.visualize_bev_original_labels(
+                pts, info,
+                save_path=f"{pf}_bev_original_labels.png" if pf else None
+            )
+
         if show_3d:
             self.visualize_3d(pts, boxes, save_path=f"{pf}_3d.png" if pf else "frame3d.png")
 
@@ -868,6 +1013,9 @@ def parse_args():
                         help='BEV + camera FOV overlay (green=in FOV, red=out FOV)')
     parser.add_argument('--show_image_proj', action='store_true',
                         help='Project points/boxes onto camera image')
+    parser.add_argument('--show_spd_original_labels', '--show_original_labels', action='store_true',
+                        dest='show_spd_original_labels',
+                        help='BEV with original SPD labels from label/lidar/*.json (green=has pts, red=no pts). pkl contains nuScenes-converted labels; this flag shows raw SPD labels.')
     parser.add_argument('--analyze_fov', action='store_true',
                         help='Count GT in/out camera FOV across frames')
     parser.add_argument('--check_continuity', action='store_true')
@@ -893,6 +1041,7 @@ if __name__ == "__main__":
         show_3d=args.show_3d,
         show_bev_fov=args.show_bev_fov,
         show_image_proj=args.show_image_proj,
+        show_spd_original_labels=args.show_spd_original_labels,
         analyze_fov=args.analyze_fov,
         check_continuity=args.check_continuity,
         export_video=args.export_video,

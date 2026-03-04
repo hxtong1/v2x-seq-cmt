@@ -3,14 +3,16 @@ import shutil
 import os
 import os.path as osp
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pyquaternion
+from tqdm import tqdm
 
-from spd_to_uniad import create_spd_infos, _get_instance_token_mappings,create_spd_infos_coop
-from spd_to_uniad import load_json, write_json, visibility_mappings
+from spd_to_uniad import create_spd_infos, _get_instance_token_mappings, create_spd_infos_coop
+from spd_to_uniad import load_json, write_json, visibility_mappings, ATTRIBUTE_MAPPING
 
 
-## UniV2X TODO: update token if neccesary
+# UniV2X TODO: update token if neccesary
 def generate_category_json(data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating category json ---------------------")
     if not os.path.exists(osp.join(data_root, version)):
@@ -21,18 +23,35 @@ def generate_category_json(data_root, version='v1.0-mini', local_root=''):
     shutil.copy(sr_file, target_file_path)
 
 
-## UniV2X TODO: check empty is possible
 def generate_attribute_json(data_root, version='v1.0-mini', local_root=''):
+    """Generate attribute.json from ATTRIBUTE_MAPPING (or copy from local_root if non-empty)."""
     print("--------------------- Start generating attribute json ---------------------")
     if not os.path.exists(osp.join(data_root, version)):
         os.mkdir(osp.join(data_root, version))
 
     sr_file = osp.join(local_root, 'attribute.json')
     target_file_path = osp.join(data_root, version, 'attribute.json')
-    shutil.copy(sr_file, target_file_path)
+
+    if osp.isfile(sr_file):
+        existing = load_json(sr_file)
+        if existing and len(existing) > 0:
+            shutil.copy(sr_file, target_file_path)
+            return
+
+    # Generate from ATTRIBUTE_MAPPING (nuScenes format)
+    attr_list = []
+    for name in ATTRIBUTE_MAPPING.keys():
+        attr_list.append({
+            'token': str(uuid.uuid4()),
+            'name': name,
+            'description': name.replace('.', ' ').replace('_', ' ')
+        })
+    attr_list.append({'token': str(uuid.uuid4()),
+                     'name': 'None', 'description': 'None'})
+    write_json(attr_list, target_file_path)
 
 
-## UniV2X TODO: check the mapping in spd_to_uniad is correct
+# UniV2X TODO: check the mapping in spd_to_uniad is correct
 def generate_visibility_json(data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating visibility json ---------------------")
     if not os.path.exists(osp.join(data_root, version)):
@@ -43,10 +62,11 @@ def generate_visibility_json(data_root, version='v1.0-mini', local_root=''):
     shutil.copy(sr_file, target_file_path)
 
 
-## UniV2X TODO: check the mapping in spd_to_uniad is correct
+# UniV2X TODO: check the mapping in spd_to_uniad is correct
 def generate_instance_json(total_annotations, sample_info_mappings, data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating instance json ---------------------")
-    instance_token_mappings = _get_instance_token_mappings(total_annotations, sample_info_mappings)
+    instance_token_mappings = _get_instance_token_mappings(
+        total_annotations, sample_info_mappings)
 
     category_data = load_json(osp.join(local_root, 'category.json'))
     category_token_mappings = {}
@@ -54,7 +74,7 @@ def generate_instance_json(total_annotations, sample_info_mappings, data_root, v
         category_token_mappings[category_type['name']] = category_type['token']
 
     instance_json_datas = []
-    for instance_token in instance_token_mappings.keys():
+    for instance_token in tqdm(instance_token_mappings.keys(), desc="instance_json"):
         cur_instance_samples = instance_token_mappings[instance_token]
         nbr_annotations = len(cur_instance_samples)
         category_name = cur_instance_samples[0]['annotation']['type']
@@ -73,7 +93,7 @@ def generate_instance_json(total_annotations, sample_info_mappings, data_root, v
     write_json(instance_json_datas, target_file_path)
 
 
-## UniV2X TODO: consider infrastructure case with different sensors in different intersection
+# UniV2X TODO: consider infrastructure case with different sensors in different intersection
 def generate_sensor_json(data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating sensor json ---------------------")
     if not os.path.exists(osp.join(data_root, version)):
@@ -84,8 +104,8 @@ def generate_sensor_json(data_root, version='v1.0-mini', local_root=''):
     shutil.copy(sr_file, target_file_path)
 
 
-## UniV2X TODO: consider infrastructure case with different sensors in different intersection
-## UniV2X TODO: reduce hard code
+# UniV2X TODO: consider infrastructure case with different sensors in different intersection
+# UniV2X TODO: reduce hard code
 def generate_calibrated_sensor_json(spd_infos, data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating calibrated_sensors json ---------------------")
 
@@ -111,10 +131,14 @@ def generate_calibrated_sensor_json(spd_infos, data_root, version='v1.0-mini', l
         print(sensor_info['channel'])
         if sensor_info['channel'] in calibrated_sensors:
             if sensor_info['modality'] == 'camera':
-                rotation = spd_infos[0]['cams'][sensor_info['channel']]['sensor2ego_rotation']
-                translation = spd_infos[0]['cams'][sensor_info['channel']]['sensor2ego_translation']
-                camera_intrinsic = spd_infos[0]['cams'][sensor_info['channel']]['cam_intrinsic']
-                token = gen_token(sensor_info['channel'], str(translation[0]), str(translation[1]), str(translation[2]))
+                rotation = spd_infos[0]['cams'][sensor_info['channel']
+                                                ]['sensor2ego_rotation']
+                translation = spd_infos[0]['cams'][sensor_info['channel']
+                                                   ]['sensor2ego_translation']
+                camera_intrinsic = spd_infos[0]['cams'][sensor_info['channel']
+                                                        ]['cam_intrinsic']
+                token = gen_token(sensor_info['channel'], str(
+                    translation[0]), str(translation[1]), str(translation[2]))
                 info = {
                     'token': token,
                     'sensor_token': sensor_info['token'],
@@ -125,7 +149,8 @@ def generate_calibrated_sensor_json(spd_infos, data_root, version='v1.0-mini', l
             else:
                 rotation = spd_infos[0]['lidar2ego_rotation']
                 translation = spd_infos[0]['lidar2ego_translation']
-                token = gen_token(sensor_info['channel'], str(translation[0]), str(translation[1]), str(translation[2]))
+                token = gen_token(sensor_info['channel'], str(
+                    translation[0]), str(translation[1]), str(translation[2]))
                 info = {
                     'token': token,
                     'sensor_token': sensor_info['token'],
@@ -139,12 +164,12 @@ def generate_calibrated_sensor_json(spd_infos, data_root, version='v1.0-mini', l
     write_json(calibrated_sensor_infos, target_file_path)
 
 
-## UniV2X TODO: update token, now we use sample_token as ego pose token
+# UniV2X TODO: update token, now we use sample_token as ego pose token
 def generate_ego_pose_json(spd_infos, data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating ego_pose json ---------------------")
 
     ego_pose_infos = []
-    for spd_info in spd_infos:
+    for spd_info in tqdm(spd_infos, desc="ego_pose_json"):
         info = {
             'token': spd_info['token'],
             'timestamp': spd_info['timestamp'],
@@ -158,7 +183,7 @@ def generate_ego_pose_json(spd_infos, data_root, version='v1.0-mini', local_root
     write_json(ego_pose_infos, target_file_path)
 
 
-## UniV2X TODO: update the log json with whole intersections
+# UniV2X TODO: update the log json with whole intersections
 def generate_log_json(data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating log json ---------------------")
 
@@ -170,7 +195,7 @@ def generate_log_json(data_root, version='v1.0-mini', local_root=''):
     shutil.copy(sr_file, target_file_path)
 
 
-## UniV2X TODO: None
+# UniV2X TODO: None
 def generate_scene_json(sample_info_mappings, data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating scene json ---------------------")
 
@@ -207,10 +232,10 @@ def generate_scene_json(sample_info_mappings, data_root, version='v1.0-mini', lo
     write_json(scene_infos, target_file_path)
 
 
-## UniV2X TODO: update the image sample token generation
-## UniV2X TODO: remove the hard code about sensor_name
-## UniV2X TODO: we need consider generating different image samples by sensor json
-## UniV2X TODO: token in sample json and sample_data json
+# UniV2X TODO: update the image sample token generation
+# UniV2X TODO: remove the hard code about sensor_name
+# UniV2X TODO: we need consider generating different image samples by sensor json
+# UniV2X TODO: token in sample json and sample_data json
 def generate_sample_json(sample_info_mappings, data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating sample json ---------------------")
 
@@ -229,11 +254,12 @@ def generate_sample_json(sample_info_mappings, data_root, version='v1.0-mini', l
         return str(token)
 
     sensor_name = 'VEHICLE_CAM_FRONT'
-    for sample_token in sample_info_mappings.keys():
-        sample_info_mappings[sample_token]['image_token'] = gen_token(sensor_name, sample_token)
+    for sample_token in tqdm(sample_info_mappings.keys(), desc="sample_json prep"):
+        sample_info_mappings[sample_token]['image_token'] = gen_token(
+            sensor_name, sample_token)
 
     image_sample_infos = []
-    for sample_token in sample_info_mappings.keys():
+    for sample_token in tqdm(sample_info_mappings.keys(), desc="sample_json"):
         sample_info = sample_info_mappings[sample_token]
         prev_token = '' if sample_info['prev'] == '' else sample_info_mappings[sample_info['prev']]['image_token']
         next_token = '' if sample_info['next'] == '' else sample_info_mappings[sample_info['next']]['image_token']
@@ -258,19 +284,25 @@ def generate_sample_json(sample_info_mappings, data_root, version='v1.0-mini', l
     write_json(image_sample_infos, target_file_path)
 
 
-## UniV2X TODO: update token
-## UniV2X TODO: now each frame is considered as key frame, we should consider 2HZ later.
-## UniV2X TODO: rm the hardcode to select calibrated_sensor_token
+# UniV2X TODO: update token
+# UniV2X TODO: now each frame is considered as key frame, we should consider 2HZ later.
 def generate_sample_data_json(spd_infos, data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating sample data json ---------------------")
 
-    calibrated_sensor_data = load_json(osp.join(data_root, version, 'calibrated_sensor.json'))
+    calibrated_sensor_data = load_json(
+        osp.join(data_root, version, 'calibrated_sensor.json'))
+    cam_calib_token = lidar_calib_token = None
     for calibrated_sensor in calibrated_sensor_data:
-        if calibrated_sensor['camera_intrinsic'] is not []:
-            calibrated_sensor_token = calibrated_sensor['token']
+        if calibrated_sensor.get('camera_intrinsic') and len(calibrated_sensor['camera_intrinsic']) > 0:
+            cam_calib_token = calibrated_sensor['token']
+        else:
+            lidar_calib_token = calibrated_sensor['token']
+    calibrated_sensor_token = lidar_calib_token or cam_calib_token or calibrated_sensor_data[
+        0]['token']
 
     sample_data_infos = []
-    for sample_info in spd_infos:
+    for sample_info in tqdm(spd_infos, desc="sample_data_json"):
+        # Keyframe lidar sample_data
         info = {
             'token': sample_info['token'],
             'sample_token': sample_info['token'],
@@ -278,24 +310,48 @@ def generate_sample_data_json(spd_infos, data_root, version='v1.0-mini', local_r
             'calibrated_sensor_token': calibrated_sensor_token,
             'timestamp': sample_info['timestamp'],
             'fileformat': 'pcd',
-            'is_key_frame': bool(1),
+            'is_key_frame': True,
             'height': 0,
             'width': 0,
             'filename': sample_info['lidar_path'],
             'prev': sample_info['prev'],
             'next': sample_info['next']
         }
-
         sample_data_infos.append(info)
+
+        # Sweep sample_data (non-keyframe past frames)
+        for sweep in sample_info.get('sweeps', []):
+            sweep_token = str(uuid.uuid4())
+            kf_ts = float(sample_info['timestamp'])
+            rel_time = sweep.get('timestamp', 0)
+            # rel_time is seconds from sweep to keyframe; sweep_ts = kf_ts - rel_time (same unit as kf_ts)
+            if kf_ts > 1e10:
+                sweep_ts = int(kf_ts - rel_time * 1e6)  # kf in us
+            else:
+                sweep_ts = kf_ts - rel_time
+            sample_data_infos.append({
+                'token': sweep_token,
+                'sample_token': sample_info['token'],
+                'ego_pose_token': sample_info['token'],
+                'calibrated_sensor_token': calibrated_sensor_token,
+                'timestamp': sweep_ts,
+                'fileformat': 'pcd',
+                'is_key_frame': False,
+                'height': 0,
+                'width': 0,
+                'filename': sweep['lidar_path'],
+                'prev': '',
+                'next': ''
+            })
 
     target_file_path = osp.join(data_root, version, 'sample_data.json')
     write_json(sample_data_infos, target_file_path)
 
 
-## UniV2X TODO: 'attribute_tokens'
-## UniV2X TODO: check 'size' wlh or lwh
-## UniV2X TODO: check 'num_lidar_pts'
-## UniV2X TODO: check the rotation_z2quaternion
+# UniV2X TODO: 'attribute_tokens'
+# UniV2X TODO: check 'size' wlh or lwh
+# UniV2X TODO: check 'num_lidar_pts'  ## Aready Done
+# UniV2X TODO: check the rotation_z2quaternion
 def rotation_z2quaternion(rotation_z):
     # https://www.zhihu.com/question/23005815/answer/33971127
     import math
@@ -305,74 +361,87 @@ def rotation_z2quaternion(rotation_z):
     return q
 
 
-def generate_sample_annotation_json(total_annotations, spd_infos, sample_info_mappings, data_root, version='v1.0-mini', local_root=''):
-    print("--------------------- Start generating sample annotation json ---------------------")
+def _process_one_sample_annotations(sample_token, annotations, spd_info, visibility_mappings):
+    """Process annotations for a single sample. Returns list of ann_info dicts."""
     import numpy as np
     from pyquaternion import Quaternion
 
+    if spd_info is None:
+        return []
+    sample_lidar2ego_rotation = Quaternion(spd_info['lidar2ego_rotation'])
+    sample_lidar2ego_translation = np.array(spd_info['lidar2ego_translation'])
+    sample_ego2global_rotation = Quaternion(spd_info['ego2global_rotation'])
+    sample_ego2global_translation = np.array(
+        spd_info['ego2global_translation'])
+    anno_to_idx = {t: i for i, t in enumerate(spd_info.get('anno_tokens', []))}
+    num_lidar_pts_arr = spd_info.get('num_lidar_pts', np.zeros(0))
+
+    ann_infos = []
+    for anno_token in annotations.keys():
+        annotation = annotations[anno_token]
+        center = np.array([annotation['3d_location']['x'], annotation['3d_location']['y'],
+                           annotation['3d_location']['z']])
+        rot = Quaternion(axis=[0, 0, 1], radians=annotation['rotation'])
+        center = np.dot(sample_lidar2ego_rotation.rotation_matrix,
+                        center) + sample_lidar2ego_translation
+        rot = sample_lidar2ego_rotation * rot
+        center = np.dot(sample_ego2global_rotation.rotation_matrix,
+                        center) + sample_ego2global_translation
+        rot = sample_ego2global_rotation * rot
+        idx = anno_to_idx.get(anno_token, -1)
+        num_lidar_pts = int(num_lidar_pts_arr[idx]) if idx >= 0 and idx < len(
+            num_lidar_pts_arr) else 0
+        attribute_tokens = []
+        ann_infos.append({
+            'token': annotation['token'],
+            'sample_token': sample_token,
+            'instance_token': annotation['instance_token'],
+            'visibility_token': visibility_mappings[annotation['occluded_state']],
+            'attribute_tokens': attribute_tokens,
+            'translation': center.tolist(),
+            'size': [annotation['3d_dimensions']['w'], annotation['3d_dimensions']['l'],
+                     annotation['3d_dimensions']['h']],
+            'rotation': rot.elements.tolist(),
+            'prev': annotation['prev'],
+            'next': annotation['next'],
+            'num_lidar_pts': num_lidar_pts,
+            'num_radar_pts': 0
+        })
+    return ann_infos
+
+
+def generate_sample_annotation_json(total_annotations, spd_infos, sample_info_mappings, data_root, version='v1.0-mini', local_root='', max_workers=8):
+    print("--------------------- Start generating sample annotation json ---------------------")
+
     spd_info_map = {info['token']: info for info in spd_infos}
+    sample_tokens = list(total_annotations.keys())
+
+    results_by_token = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _process_one_sample_annotations,
+                sample_token,
+                total_annotations[sample_token],
+                spd_info_map.get(sample_token),
+                visibility_mappings,
+            ): sample_token
+            for sample_token in sample_tokens
+        }
+        for future in tqdm(as_completed(futures), total=len(futures), desc="sample_annotation_json"):
+            sample_token = futures[future]
+            ann_infos = future.result()
+            results_by_token[sample_token] = ann_infos
 
     sample_annotation_infos = []
-    for sample_token in total_annotations.keys():
-        annotations = total_annotations[sample_token]
-        sample_info = sample_info_mappings[sample_token]
-        scene_token = sample_info['scene_token']
-
-        spd_info = spd_info_map.get(sample_token)
-        if spd_info is None:
-            continue
-        sample_lidar2ego_rotation = Quaternion(spd_info['lidar2ego_rotation'])
-        sample_lidar2ego_translation = np.array(spd_info['lidar2ego_translation'])
-        sample_ego2global_rotation = Quaternion(spd_info['ego2global_rotation'])
-        sample_ego2global_translation = np.array(spd_info['ego2global_translation'])
-
-        anno_to_idx = {t: i for i, t in enumerate(spd_info.get('anno_tokens', []))}
-        num_lidar_pts_arr = spd_info.get('num_lidar_pts', np.zeros(0))
-
-        for anno_token in annotations.keys():
-            annotation = annotations[anno_token]
-
-            # cvt global
-            center = np.array([annotation['3d_location']['x'], annotation['3d_location']['y'],
-                               annotation['3d_location']['z']])
-            rot = Quaternion(axis=[0, 0, 1], radians=annotation['rotation'])
-
-            # lidar2ego
-            center = np.dot(sample_lidar2ego_rotation.rotation_matrix, center) + sample_lidar2ego_translation
-            rot = sample_lidar2ego_rotation * rot
-
-            # ego2global
-            center = np.dot(sample_ego2global_rotation.rotation_matrix, center) + sample_ego2global_translation
-            rot = sample_ego2global_rotation * rot
-
-            idx = anno_to_idx.get(anno_token, -1)
-            num_lidar_pts = int(num_lidar_pts_arr[idx]) if idx >= 0 and idx < len(num_lidar_pts_arr) else 0
-            # attribute_tokens: nuScenes uses token strings; keep [] if no mapping
-            attribute_tokens = []
-
-            ann_info = {
-                'token': annotation['token'],
-                'sample_token': sample_token,
-                'instance_token': annotation['instance_token'],
-                'visibility_token': visibility_mappings[annotation['occluded_state']],
-                'attribute_tokens': attribute_tokens,
-                'translation': center.tolist(),
-                'size': [annotation['3d_dimensions']['w'], annotation['3d_dimensions']['l'],
-                         annotation['3d_dimensions']['h']],
-                'rotation': rot.elements.tolist(),
-                'prev': annotation['prev'],
-                'next': annotation['next'],
-                'num_lidar_pts': num_lidar_pts,
-                'num_radar_pts': 0
-            }
-
-            sample_annotation_infos.append(ann_info)
+    for sample_token in sample_tokens:
+        sample_annotation_infos.extend(results_by_token.get(sample_token, []))
 
     target_file_path = osp.join(data_root, version, 'sample_annotation.json')
     write_json(sample_annotation_infos, target_file_path)
 
 
-## UniV2X TODO: use hd-map from DAIR-V2X
+# UniV2X TODO: use hd-map from DAIR-V2X
 def generate_map_json(data_root, version='v1.0-mini', local_root=''):
     print("--------------------- Start generating map json ---------------------")
 
@@ -399,13 +468,19 @@ def generate_map_json(data_root, version='v1.0-mini', local_root=''):
 def parse_args():
     parser = argparse.ArgumentParser(
         description='MMDet test (and eval) a model')
-    parser.add_argument('--data-root', type=str, default="./datasets/V2X-Seq-SPD-Example")
-    parser.add_argument('--save-root', type=str, default="./datasets/V2X-Seq-SPD-Example")
-    parser.add_argument('--split-file', type=str, default="./data/split_datas/cooperative-split-data-spd.json")
-    parser.add_argument('--local-root', type=str, default="./tools/spd_data_converter/nuscenes_jsons")
+    parser.add_argument('--data-root', type=str,
+                        default="./datasets/V2X-Seq-SPD-Example")
+    parser.add_argument('--save-root', type=str,
+                        default="./datasets/V2X-Seq-SPD-Example")
+    parser.add_argument('--split-file', type=str,
+                        default="./data/split_datas/cooperative-split-data-spd.json")
+    parser.add_argument('--local-root', type=str,
+                        default="./tools/spd_data_converter/nuscenes_jsons")
     parser.add_argument('--v2x-side', type=str, default="vehicle-side")
     parser.add_argument('--version', type=str, default="v1.0-trainval")
     parser.add_argument('--info-prefix', type=str, default="spd")
+    parser.add_argument('--max-workers', type=int, default=8,
+                        help='Thread workers for sample_annotation_json')
 
     args = parser.parse_args()
     return args
@@ -420,7 +495,7 @@ if __name__ == "__main__":
     # save_root = osp.join(args.save_root, v2x_side)
     data_root = args.data_root
     save_root = args.save_root
-        
+
     local_root = args.local_root
     split_path = args.split_file
     can_bus_root_path = ''
@@ -429,25 +504,25 @@ if __name__ == "__main__":
     if v2x_side == 'cooperative':
         print('this is cooperative!')
         total_annotations, sample_info_mappings, spd_infos = create_spd_infos_coop(data_root,
-                            save_root,
-                            v2x_side,
-                            split_path, 
-                            can_bus_root_path,
-                            info_prefix,
-                            version=version,
-                            max_sweeps=10,
-                            flag_save=False)  
-    else:      
-        print('this is single!')  
-        total_annotations, sample_info_mappings, spd_infos = create_spd_infos(data_root,
-                                                                            save_root,
-                                                                            v2x_side,
-                                                                            split_path,
-                                                                            can_bus_root_path,
-                                                                            info_prefix,
-                                                                            version=version,
-                                                                            max_sweeps=10,
-                                                                            flag_save=False)
+                                                                                   save_root,
+                                                                                   v2x_side,
+                                                                                   split_path,
+                                                                                   can_bus_root_path,
+                                                                                   info_prefix,
+                                                                                   version=version,
+                                                                                   max_sweeps=10,
+                                                                                   flag_save=False)
+    else:
+        print('this is single!')
+        total_annotations, sample_info_mappings, spd_infos = create_spd_infos(
+            data_root,
+            save_root,
+            v2x_side,
+            split_path,
+            info_prefix,
+            version=version,
+            max_sweeps=10,
+            flag_save=False)
 
     save_root = osp.join(args.save_root, v2x_side)
 
@@ -507,7 +582,8 @@ if __name__ == "__main__":
                                     sample_info_mappings,
                                     save_root,
                                     version=version,
-                                    local_root=local_root)
+                                    local_root=local_root,
+                                    max_workers=args.max_workers)
 
     generate_map_json(save_root,
                       version=version,
