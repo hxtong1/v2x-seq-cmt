@@ -579,36 +579,24 @@ def get_lidar_ego_global_infos(root_path, data_infos, v2x_side):
                 [q.w, q.x, q.y, q.z], dtype=np.float32)
             lidar_ego_global_infos[sample_token]['ego2global_translation'] = t
 
-        else:  # vehicle-side
-            # LiDAR -> Ego
+        else:  # vehicle-side（与 vis_gt 一致：直接使用标定矩阵，不做 orthonormalize，保证 velocity 等计算一致）
             calib_l2e_path = osp.join(
                 root_path, data_info['calib_lidar_to_novatel_path'])
             calib_l2e = load_json(calib_l2e_path)
-            R_l2e = orthonormalize_rotation(
-                np.array(calib_l2e['transform']['rotation'], dtype=np.float32))
-            t_l2e = np.array(
-                calib_l2e['transform']['translation'], dtype=np.float32).reshape(3)
-            q_l2e = Quaternion(matrix=R_l2e)
+            q_l2e = Quaternion(matrix=np.array(calib_l2e['transform']['rotation']))
             lidar_ego_global_infos[sample_token]['lidar2ego_rotation'] = np.array(
                 [q_l2e.w, q_l2e.x, q_l2e.y, q_l2e.z], dtype=np.float32)
-            lidar_ego_global_infos[sample_token]['lidar2ego_translation'] = t_l2e
+            lidar_ego_global_infos[sample_token]['lidar2ego_translation'] = np.array(
+                calib_l2e['transform']['translation'], dtype=np.float32).reshape(3)
 
-            # Ego -> Global
             calib_e2g_path = osp.join(
                 root_path, data_info['calib_novatel_to_world_path'])
             calib_e2g = load_json(calib_e2g_path)
-            R_e2g = orthonormalize_rotation(
-                np.array(calib_e2g['rotation'], dtype=np.float32))
-            t_e2g = np.array(calib_e2g['translation'],
-                             dtype=np.float32).reshape(3)
-            try:
-                q_e2g = Quaternion(matrix=R_e2g)
-            except ValueError:
-                R_e2g = iterative_closest_point(R_e2g.astype(np.float64))
-                q_e2g = Quaternion(matrix=R_e2g)
+            q_e2g = Quaternion(matrix=np.array(calib_e2g['rotation']))
             lidar_ego_global_infos[sample_token]['ego2global_rotation'] = np.array(
                 [q_e2g.w, q_e2g.x, q_e2g.y, q_e2g.z], dtype=np.float32)
-            lidar_ego_global_infos[sample_token]['ego2global_translation'] = t_e2g
+            lidar_ego_global_infos[sample_token]['ego2global_translation'] = np.array(
+                calib_e2g['translation'], dtype=np.float32).reshape(3)
 
         # 4x4 transformation matrices
         lidar_ego_global_infos[sample_token]['T_lidar2ego'] = get_transformation_matrix(
@@ -635,7 +623,7 @@ def cal_ego_velocity(data_infos, sample_info_mappings, lidar_ego_global_infos):
             lidar_ego_global_infos[token]['ego2global_translation'],
             dtype=np.float32
         )
-        cur_time = float(sample_info_mappings[token]['timestamp']) / 1e6
+        cur_time = float(sample_info_mappings[token]['timestamp'])
 
         # ---------- 第一帧 ----------
         if i == 0:
@@ -645,7 +633,7 @@ def cal_ego_velocity(data_infos, sample_info_mappings, lidar_ego_global_infos):
                 dtype=np.float32
             )
             next_time = float(
-                sample_info_mappings[next_token]['timestamp']) / 1e6
+                sample_info_mappings[next_token]['timestamp'])
             dt = next_time - cur_time
             ego_velocity[token] = (next_loc - cur_loc)[:2] / max(dt, 1e-6)
 
@@ -657,7 +645,7 @@ def cal_ego_velocity(data_infos, sample_info_mappings, lidar_ego_global_infos):
                 dtype=np.float32
             )
             prev_time = float(
-                sample_info_mappings[prev_token]['timestamp']) / 1e6
+                sample_info_mappings[prev_token]['timestamp'])
             dt = cur_time - prev_time
             ego_velocity[token] = (cur_loc - prev_loc)[:2] / max(dt, 1e-6)
 
@@ -676,9 +664,9 @@ def cal_ego_velocity(data_infos, sample_info_mappings, lidar_ego_global_infos):
             )
 
             prev_time = float(
-                sample_info_mappings[prev_token]['timestamp']) / 1e6
+                sample_info_mappings[prev_token]['timestamp'])
             next_time = float(
-                sample_info_mappings[next_token]['timestamp']) / 1e6
+                sample_info_mappings[next_token]['timestamp'])
 
             dt = next_time - prev_time
             ego_velocity[token] = (next_loc - prev_loc)[:2] / max(dt, 1e-6)
@@ -780,6 +768,7 @@ def loc_linear_interpolation(
         lidar_ego_global_info_1,
         cur_lidar_ego_global_info):
     """Use linear interpolation to estimate the 3d location for occluded objects.
+    与 vis_gt 完全一致：timestamp /1e6 转秒，center 在 global 下插值
     """
     timestamp_ii_0 = float(timestamp_ii_0) / 1e6
     timestamp_ii_1 = float(timestamp_ii_1) / 1e6
@@ -791,8 +780,6 @@ def loc_linear_interpolation(
         + np.array(lidar_ego_global_info_0['lidar2ego_translation'])
     center_0 = np.dot(Quaternion(lidar_ego_global_info_0['ego2global_rotation']).rotation_matrix, center_0) \
         + np.array(lidar_ego_global_info_0['ego2global_translation'])
-
-    center_0 = np.array([loc_ii_0['x'], loc_ii_0['y'], loc_ii_0['z']])
 
     # cvt to global
     center_1 = np.array([loc_ii_1['x'], loc_ii_1['y'], loc_ii_1['z']])
@@ -808,18 +795,16 @@ def loc_linear_interpolation(
     # cur sesor data interpolation
     global2ego_r = np.linalg.inv(Quaternion(
         cur_lidar_ego_global_info['ego2global_rotation']).rotation_matrix)
-    global2ego_t = - \
-        np.array(cur_lidar_ego_global_info['ego2global_translation']).reshape(
-            1, 3) @ global2ego_r.T
+    global2ego_t = - np.array(cur_lidar_ego_global_info['ego2global_translation']).reshape(1, 3) @ global2ego_r.T
+    global2ego_t = global2ego_t.reshape(3)
 
     ego2lidar_r = np.linalg.inv(Quaternion(
         cur_lidar_ego_global_info['lidar2ego_rotation']).rotation_matrix)
-    ego2lidar_t = - \
-        np.array(cur_lidar_ego_global_info['lidar2ego_translation']).reshape(
-            1, 3) @ ego2lidar_r.T
+    ego2lidar_t = - np.array(cur_lidar_ego_global_info['lidar2ego_translation']).reshape(1, 3) @ ego2lidar_r.T
+    ego2lidar_t = ego2lidar_t.reshape(3)
 
-    cur_center = np.dot(global2ego_r, cur_center) + global2ego_t.reshape(3)
-    cur_center = np.dot(ego2lidar_r, cur_center) + ego2lidar_t.reshape(3)
+    cur_center = np.dot(global2ego_r, cur_center) + global2ego_t
+    cur_center = np.dot(ego2lidar_r, cur_center) + ego2lidar_t
     locs_out = {'x': cur_center[0], 'y': cur_center[1], 'z': cur_center[2]}
 
     return locs_out
@@ -827,18 +812,27 @@ def loc_linear_interpolation(
 
 def rot_linear_interpolation(rot_ii_0, rot_ii_1, timestamp_ii_0, timestamp_ii_1, cur_timestamp):
     """Use linear interpolation to estimate the rotation for occluded objects.
+    与 vis_gt 一致
     """
     timestamp_ii_0 = float(timestamp_ii_0) / 1e6
     timestamp_ii_1 = float(timestamp_ii_1) / 1e6
     cur_timestamp = float(cur_timestamp) / 1e6
 
-    # cur_rot  = (rot_ii_1 - rot_ii_0) / (timestamp_ii_1 - timestamp_ii_0) * (cur_timestamp - timestamp_ii_0) + rot_ii_0
+    time_ratio = (cur_timestamp - timestamp_ii_0) / (timestamp_ii_1 - timestamp_ii_0)
+    diff = rot_ii_1 - rot_ii_0 + pi
+    if diff < 0:
+        diff = diff + pi
+    elif diff > 2 * pi:
+        diff = diff - 3 * pi
+    else:
+        diff = diff - pi
 
-    q0 = Quaternion(axis=[0, 0, 1], angle=rot_ii_0)
-    q1 = Quaternion(axis=[0, 0, 1], angle=rot_ii_1)
+    cur_rot = time_ratio * diff + rot_ii_0
+    if cur_rot < -pi:
+        cur_rot = cur_rot + 2 * pi
+    if cur_rot > 2 * pi:
+        cur_rot = cur_rot - 2 * pi
 
-    ratio = (cur_timestamp - timestamp_ii_0)/(timestamp_ii_1 - timestamp_ii_0)
-    cur_rot = Quaternion.slerp(q0, q1, ratio).yaw_pitch_roll[0]
     return cur_rot
 
 # -----------Veloctity Process--------------
@@ -914,17 +908,59 @@ def _generate_unvisible_annotations(
                 cur_frame_idx += 1
         return results
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_instance, inst)
-                   for inst in instance_token_mappings]
-
-        for f in tqdm(as_completed(futures), total=len(futures), desc="annotation_track"):
-            for sample_token, anno_token, anno in f.result():
-                if sample_token not in total_annotations:
-                    total_annotations[sample_token] = {}
-                total_annotations[sample_token][anno_token] = anno
+    # 保持与 vis_gt 一致的迭代顺序（instance_token_mappings 顺序），确保 total_annotations 确定性
+    for instance_token in tqdm(instance_token_mappings, desc="annotation_track"):
+        for sample_token, anno_token, anno in process_instance(instance_token):
+            if sample_token not in total_annotations:
+                total_annotations[sample_token] = {}
+            total_annotations[sample_token][anno_token] = anno
 
     return total_annotations
+
+
+def global_to_lidar(global_point, lidar_ego_global_info):
+    """
+    Convert global coordinate to lidar coordinate.
+
+    Args:
+        global_point (np.array): [x, y, z] in global coordinate
+        lidar_ego_global_info (dict): lidar->ego and ego->global transforms
+
+    Returns:
+        np.array: [x, y, z] in lidar coordinate
+    """
+    # Get transformation matrices
+    e2g_r = Quaternion(lidar_ego_global_info['ego2global_rotation']).rotation_matrix
+    e2g_t = np.array(lidar_ego_global_info['ego2global_translation'])
+    l2e_r = Quaternion(lidar_ego_global_info['lidar2ego_rotation']).rotation_matrix
+    l2e_t = np.array(lidar_ego_global_info['lidar2ego_translation'])
+
+    # Global -> Ego
+    ego_point = np.dot(e2g_r.T, global_point - e2g_t)
+
+    # Ego -> LiDAR
+    lidar_point = np.dot(l2e_r.T, ego_point - l2e_t)
+
+    return lidar_point
+
+
+def global_velocity_to_lidar(velocity_xy_global, lidar_ego_global_info):
+    """
+    Convert velocity from global frame to lidar frame (NuScenes convention).
+    NuScenes stores gt_velocity in lidar frame (absolute velocity expressed in lidar axes).
+
+    Args:
+        velocity_xy_global (np.array): [vx, vy] in global frame (m/s)
+        lidar_ego_global_info (dict): lidar->ego and ego->global transforms
+
+    Returns:
+        np.array: [vx, vy] in lidar frame
+    """
+    e2g_r = Quaternion(lidar_ego_global_info['ego2global_rotation']).rotation_matrix
+    l2e_r = Quaternion(lidar_ego_global_info['lidar2ego_rotation']).rotation_matrix
+    velo = np.array([*np.asarray(velocity_xy_global).flat[:2], 0.0], dtype=np.float64)
+    velo = velo @ np.linalg.inv(e2g_r).T @ np.linalg.inv(l2e_r).T
+    return velo[:2].astype(np.float32)
 
 
 def _add_annotation_velocity_prev_next(
@@ -934,99 +970,70 @@ def _add_annotation_velocity_prev_next(
     max_workers=None
 ):
     """
-    Generate velocity and prev/next token for annotations in NuScenes style.
-
-    Args:
-        total_annotations (dict): {frame_id: {anno_token: anno_dict}}
-        instance_token_mappings (dict): {instance_token: list of sample annotations}
-        lidar_ego_global_infos (dict): {sample_token: lidar->ego, ego->global transforms}
-
-    Returns:
-        total_annotations, instance_token_mappings
+    velocity 在 current frame lidar 下计算: (center_1 变换到 frame0 lidar - center_0) / time_delta
+    与 vis_gt 完全一致：timestamp 始终 /1e6 转秒，变换公式一致
     """
     if max_workers is None:
         max_workers = THREAD_POOL_CPU_WORKERS
+
     def process_instance(instance_token, samples):
         updated_samples = []
         num_samples = len(samples)
-
-        # 缓存旋转矩阵
-        quat_cache = {}
-
-        def get_global_center(sample_node):
-            loc = sample_node['annotation']['3d_location']
-            token = sample_node['sample_token']
-            info = lidar_ego_global_infos[token]
-
-            # cache quaternion
-            if token not in quat_cache:
-                quat_cache[token] = {
-                    'l2e_r': Quaternion(info['lidar2ego_rotation']).rotation_matrix,
-                    'e2g_r': Quaternion(info['ego2global_rotation']).rotation_matrix,
-                    'l2e_t': np.array(info['lidar2ego_translation']),
-                    'e2g_t': np.array(info['ego2global_translation'])
-                }
-
-            q = quat_cache[token]
-            center = np.dot(
-                q['l2e_r'], [loc['x'], loc['y'], loc['z']]) + q['l2e_t']
-            center = np.dot(q['e2g_r'], center) + q['e2g_t']
-            return center
-
         for ii in range(num_samples):
             curr_sample = samples[ii]
-            curr_token = curr_sample['sample_token']
-            prev_anno_token = samples[ii -
-                                      1]['annotation']['token'] if ii > 0 else ''
-            next_anno_token = samples[ii +
-                                      1]['annotation']['token'] if ii < num_samples - 1 else ''
+            prev_anno_token = samples[ii - 1]['annotation']['token'] if ii > 0 else ''
+            next_anno_token = samples[ii + 1]['annotation']['token'] if ii < num_samples - 1 else ''
 
-            try:
-                # timestamps in sample_info_mappings are already in seconds
-                if ii < num_samples - 1:
-                    t0 = float(curr_sample['timestamp'])
-                    t1 = float(samples[ii + 1]['timestamp'])
-                    p0 = get_global_center(curr_sample)
-                    p1 = get_global_center(samples[ii + 1])
-                elif num_samples > 1:
-                    t0 = float(samples[ii - 1]['timestamp'])
-                    t1 = float(curr_sample['timestamp'])
-                    p0 = get_global_center(samples[ii - 1])
-                    p1 = get_global_center(curr_sample)
+            if ii == len(samples) - 1:
+                gt_velocity = np.array([0, 0])
+            else:
+                loc_ii_0 = curr_sample['annotation']['3d_location']
+                loc_ii_1 = samples[ii + 1]['annotation']['3d_location']
+                sample_token_0 = curr_sample['sample_token']
+                sample_token_1 = samples[ii + 1]['sample_token']
+
+                center_0 = np.array([loc_ii_0['x'], loc_ii_0['y'], loc_ii_0['z']])
+                center_1 = np.array([loc_ii_1['x'], loc_ii_1['y'], loc_ii_1['z']])
+
+                # center_1: lidar1 -> ego1 -> global -> ego0 -> lidar0 (vis_gt 逻辑)
+                l2e_1 = Quaternion(lidar_ego_global_infos[sample_token_1]['lidar2ego_rotation']).rotation_matrix
+                e2g_1 = Quaternion(lidar_ego_global_infos[sample_token_1]['ego2global_rotation']).rotation_matrix
+                center_1 = np.dot(l2e_1, center_1) + np.array(lidar_ego_global_infos[sample_token_1]['lidar2ego_translation'])
+                center_1 = np.dot(e2g_1, center_1) + np.array(lidar_ego_global_infos[sample_token_1]['ego2global_translation'])
+
+                e2g_0 = Quaternion(lidar_ego_global_infos[sample_token_0]['ego2global_rotation']).rotation_matrix
+                l2e_0 = Quaternion(lidar_ego_global_infos[sample_token_0]['lidar2ego_rotation']).rotation_matrix
+                global2ego_r0 = np.linalg.inv(e2g_0)
+                global2ego_t0 = (-np.array(lidar_ego_global_infos[sample_token_0]['ego2global_translation']).reshape(1, 3) @ global2ego_r0.T).reshape(3)
+                ego2lidar_r0 = np.linalg.inv(l2e_0)
+                ego2lidar_t0 = (-np.array(lidar_ego_global_infos[sample_token_0]['lidar2ego_translation']).reshape(1, 3) @ ego2lidar_r0.T).reshape(3)
+
+                center_1 = np.dot(global2ego_r0, center_1) + global2ego_t0
+                center_1 = np.dot(ego2lidar_r0, center_1) + ego2lidar_t0
+
+                # 与 vis_gt 一致：timestamp 始终 /1e6 转为秒
+                timestamp_ii_0 = float(curr_sample['timestamp']) / 1e6
+                timestamp_ii_1 = float(samples[ii + 1]['timestamp']) / 1e6
+                time_delta = timestamp_ii_1 - timestamp_ii_0
+                if time_delta > 1e-6:
+                    gt_velocity = (center_1 - center_0)[:2] / time_delta
                 else:
-                    t0, t1, p0, p1 = 0.0, 1.0, np.zeros(3), np.zeros(3)
+                    gt_velocity = np.zeros(2)
 
-                dt = t1 - t0
-                # Guard against extremely small dt to avoid exploding velocities
-                if dt > 1e-3:
-                    gt_velocity = (p1 - p0) / dt
-                else:
-                    gt_velocity = np.zeros(3)
-
-            except KeyError:
-                gt_velocity = np.zeros(3)
-
-            curr_sample['annotation']['gt_velocity'] = gt_velocity[:2].tolist()
+            curr_sample['annotation']['gt_velocity'] = gt_velocity.tolist()
             curr_sample['annotation']['prev'] = prev_anno_token
             curr_sample['annotation']['next'] = next_anno_token
             updated_samples.append(curr_sample)
 
         return (instance_token, updated_samples)
 
-    futures = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for instance_token, samples in instance_token_mappings.items():
-            futures.append(executor.submit(
-                process_instance, instance_token, samples))
-
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="velocity_prev_next"):
-            instance_token, updated_samples = fut.result()
-            instance_token_mappings[instance_token] = updated_samples
-            # 更新 total_annotations 对应每帧
-            for sample_node in updated_samples:
-                token = sample_node['sample_token']
-                total_annotations[token][sample_node['annotation']
-                                         ['token']] = sample_node['annotation']
+    # 顺序执行，与 vis_gt 一致，确保结果确定性
+    for instance_token, samples in tqdm(instance_token_mappings.items(), desc="velocity_prev_next"):
+        _, updated_samples = process_instance(instance_token, samples)
+        instance_token_mappings[instance_token] = updated_samples
+        for sample_node in updated_samples:
+            token = sample_node['sample_token']
+            total_annotations[token][sample_node['annotation']['token']] = sample_node['annotation']
 
     return total_annotations, instance_token_mappings
 
@@ -1062,7 +1069,7 @@ def _get_instance_token_mappings(total_annotations, sample_info_mappings):
                 'annotation': annotation
             })
 
-    # 修复点：使用 .sort() 进行就地排序，确保后续插值和速度计算顺序正确
+    # 修复点：按时间戳排序，确保时间序列正确
     for i_token in instance_token_mappings:
         instance_token_mappings[i_token].sort(key=lambda x: x['frame_idx'])
 
@@ -1091,9 +1098,8 @@ def _generate_sample_infos(data_infos):
         for idx, fid in enumerate(frame_ids):
             info = {
                 'token': fid,
-                # 秒
-                'timestamp': float(sample_mappings[fid]['pointcloud_timestamp']) / 1e6,
-                'image_timestamp': float(sample_mappings[fid]['image_timestamp']) / 1e6,
+                'timestamp': float(sample_mappings[fid]['pointcloud_timestamp']),  # vis_gt：保持原始
+                'image_timestamp': float(sample_mappings[fid]['image_timestamp']),
                 'scene_token': scene_token,
                 'location': sample_mappings[fid]['intersection_loc'],
                 'frame_idx': idx,
@@ -1140,16 +1146,16 @@ def _generate_sample_infos_coop(coop_data_infos, veh_data_infos, inf_data_infos)
 
             info = {
                 'token': veh_fid,
-                'timestamp': float(veh_info['pointcloud_timestamp']) / 1e6,
-                'image_timestamp': float(veh_info['image_timestamp']) / 1e6,
+                'timestamp': float(veh_info['pointcloud_timestamp']),  # vis_gt 一致
+                'image_timestamp': float(veh_info['image_timestamp']),
                 'scene_token': veh_info['sequence_id'],
                 'location': veh_info['intersection_loc'],
                 'frame_idx': idx,
                 'prev': frame_ids[idx-1] if idx > 0 else '',
                 'next': frame_ids[idx+1] if idx < len(frame_ids)-1 else '',
                 'token_inf': inf_fid,
-                'timestamp_inf': float(inf_info['pointcloud_timestamp']) / 1e6,
-                'image_timestamp_inf': float(inf_info['image_timestamp']) / 1e6,
+                'timestamp_inf': float(inf_info['pointcloud_timestamp']),
+                'image_timestamp_inf': float(inf_info['image_timestamp']),
                 'system_error_offset': coop_info['system_error_offset']
             }
             sample_infos.append(info)
@@ -1190,11 +1196,11 @@ def _get_total_annotations(root_path, data_infos, sample_info_mappings, max_work
             ann_dict[anno_token] = anno
         return sample_token, ann_dict
 
+    # 保持 data_infos 顺序，与 vis_gt 一致（instance_token_mappings 的 frame 顺序依赖此）
     total_annotations = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(load_single_annotation, di)
-                   for di in data_infos]
-        for f in tqdm(as_completed(futures), total=len(futures), desc="Loading annotations"):
+        futures = [executor.submit(load_single_annotation, di) for di in data_infos]
+        for f in tqdm(futures, desc="Loading annotations"):
             sample_token, ann_dict = f.result()
             total_annotations[sample_token] = ann_dict
 
@@ -1246,6 +1252,9 @@ def _process_single_frame_worker(data_info):
     info['ego2global_rotation'] = lidar_ego_global_infos[sample_token]['ego2global_rotation']
     info['ego2global_translation'] = lidar_ego_global_infos[sample_token]['ego2global_translation']
 
+    # vis_gt 一致：保持 sample_info['timestamp'] 原样（sweep 内部会按需转换）
+    info['timestamp'] = sample_info['timestamp']
+
     camera_type = 'VEHICLE_CAM_FRONT'
     info['cams'] = {camera_type: {}}
     info['cams'][camera_type]['data_path'] = data_info['image_path']
@@ -1269,6 +1278,9 @@ def _process_single_frame_worker(data_info):
 
     calib_cam_intrinsic_path = osp.join(root_path, data_info['calib_camera_intrinsic_path'])
     info['cams'][camera_type]['cam_intrinsic'] = get_cam_intr(calib_cam_intrinsic_path)
+    # Add camera timestamp (matching nuScenes format, in microseconds)
+    # SPD timestamp is already in microseconds, no conversion needed
+    info['cams'][camera_type]['timestamp'] = int(float(data_info.get('image_timestamp', data_info.get('pointcloud_timestamp', 0))))
 
     info['sweeps'] = generate_sweeps(sample_token, sample_info_mappings, data_infos_mapping,
                                      lidar_ego_global_infos, max_sweeps=max_sweeps)
@@ -1276,7 +1288,9 @@ def _process_single_frame_worker(data_info):
 
     annotations = total_annotations[sample_token]
     boxes = []
-    for anno_token, annotation in annotations.items():
+    # 按 anno_token 排序，与 vis_gt 顺序一致，保证 pkl 输出顺序可对比
+    for anno_token in sorted(annotations.keys()):
+        annotation = annotations[anno_token]
         box3d = Box3D()
         box3d.center = [annotation['3d_location']['x'], annotation['3d_location']['y'], annotation['3d_location']['z']]
         box3d.wlh = [annotation['3d_dimensions']['w'], annotation['3d_dimensions']['l'], annotation['3d_dimensions']['h']]
@@ -1285,36 +1299,35 @@ def _process_single_frame_worker(data_info):
         box3d.token = annotation['token']
         box3d.instance_token = annotation['instance_token']
         box3d.track_id = int(annotation['track_id'])
-        box3d.timestamp = float(sample_info['timestamp'])
+        box3d.timestamp = float(sample_info['timestamp'])  # vis_gt 一致
         box3d.visibility = visibility_mappings[annotation['occluded_state']]
         box3d.gt_velocity = annotation['gt_velocity']
         box3d.prev = annotation['prev']
         box3d.next = annotation['next']
         boxes.append(box3d)
 
+    # gt_boxes: 3d_location is already in lidar frame, use directly
     locs = np.array([b.center for b in boxes]).reshape(-1, 3)
     dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
     rots = np.array([b.orientation_yaw_pitch_roll for b in boxes]).reshape(-1, 1)
-    info['gt_boxes'] = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
+    gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
+    info['gt_boxes'] = gt_boxes
     info['gt_names'] = np.array([b.name for b in boxes])
     info['gt_ins_tokens'] = np.array([b.instance_token for b in boxes])
     info['gt_inds'] = np.array([b.track_id for b in boxes])
     info['anno_tokens'] = np.array([b.token for b in boxes])
     info['timestamps'] = np.array([b.timestamp for b in boxes])
     info['visibility_tokens'] = np.array([b.visibility for b in boxes])
-    info['gt_velocity'] = np.array([b.gt_velocity for b in boxes])
+    # 套用 vis_gt：velocity 已在 current frame lidar 下计算，直接使用
+    info['gt_velocity'] = np.array([b.gt_velocity for b in boxes], dtype=np.float32)
     info['prev_anno_tokens'] = np.array([b.prev for b in boxes])
     info['next_anno_tokens'] = np.array([b.next for b in boxes])
 
-    lidar_file = osp.join(root_path, info['lidar_path'])
-    if len(info['gt_boxes']) > 0:
-        num_lidar_pts = compute_num_lidar_pts_per_box(lidar_file, info['gt_boxes'], load_dim=4)
-        valid_flag = num_lidar_pts > 0
-    else:
-        num_lidar_pts = np.zeros((0,), dtype=np.int64)
-        valid_flag = np.zeros((0,), dtype=bool)
-    info['num_lidar_pts'] = num_lidar_pts
-    info['valid_flag'] = valid_flag
+    # num_pts 过滤：按 box 内点云数量设置 valid_flag（dataset 会用 mask 过滤）
+    lidar_full_path = osp.join(root_path, data_info['pointcloud_path'])
+    num_lidar_pts_arr = compute_num_lidar_pts_per_box(lidar_full_path, gt_boxes, load_dim=5)
+    info['num_lidar_pts'] = num_lidar_pts_arr
+    info['valid_flag'] = num_lidar_pts_arr >= 1
 
     attributes, attribute_tokens = [], []
     for name, vel, vis, valid in zip(info['gt_names'], info['gt_velocity'], info['visibility_tokens'], info['valid_flag']):
@@ -1385,6 +1398,9 @@ def _process_single_frame_coop_worker(coop_data_info):
         system_error_offset=sample_info['system_error_offset']
     )
 
+    info['timestamp'] = sample_info['timestamp']  # vis_gt 一致
+    info['timestamp_inf'] = sample_info['timestamp_inf']
+
     veh_data_info = veh_map[veh_frame_id]
     inf_data_info = inf_map[inf_frame_id]
 
@@ -1452,6 +1468,9 @@ def _process_single_frame_coop_worker(coop_data_info):
     info['cams'][camera_type]['cam_intrinsic'] = get_cam_intr(osp.join(
         root_path, 'vehicle-side',
         veh_data_info['calib_camera_intrinsic_path']))
+    # Add camera timestamp (matching nuScenes format, in microseconds)
+    # SPD timestamp is already in microseconds, no conversion needed
+    info['cams'][camera_type]['timestamp'] = int(float(veh_data_info.get('image_timestamp', veh_data_info.get('pointcloud_timestamp', 0))))
 
     info['sweeps'] = generate_sweeps(
         sample_token, sample_info_mappings, sweep_data_mapping,
@@ -1459,9 +1478,11 @@ def _process_single_frame_coop_worker(coop_data_info):
     info['can_bus'] = process_can_bus(
         info['ego2global_translation'], info['ego2global_rotation'])
 
+    # SPD label_lidar_std_path: 3d_location is in LiDAR frame
     annotations = total_annotations[sample_token]
     boxes = []
-    for annotation in annotations.values():
+    for anno_token in sorted(annotations.keys()):
+        annotation = annotations[anno_token]
         box3d = Box3D()
         box3d.center = [
             annotation['3d_location']['x'],
@@ -1478,32 +1499,32 @@ def _process_single_frame_coop_worker(coop_data_info):
         box3d.token = annotation['token']
         box3d.instance_token = annotation['instance_token']
         box3d.track_id = int(annotation['track_id'])
-        box3d.timestamp = float(sample_info['timestamp'])
+        box3d.timestamp = float(sample_info['timestamp'])  # vis_gt 一致
         box3d.visibility = visibility_mappings[annotation['occluded_state']]
-        box3d.gt_velocity = annotation['gt_velocity']
+        box3d.gt_velocity = annotation['gt_velocity']  # in global frame
         box3d.prev = annotation['prev']
         box3d.next = annotation['next']
         boxes.append(box3d)
 
+    # gt_boxes: 3d_location is already in lidar frame, use directly
     if len(boxes) > 0:
         locs = np.array([b.center for b in boxes]).reshape(-1, 3)
         dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
         rots = np.array([b.orientation_yaw_pitch_roll for b in boxes]).reshape(-1, 1)
         gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
+        # num_pts 过滤：按 box 内点云数量设置 valid_flag
+        lidar_full_path = osp.join(root_path, 'vehicle-side', veh_data_info['pointcloud_path'])
+        num_lidar_pts = compute_num_lidar_pts_per_box(lidar_full_path, gt_boxes, load_dim=5)
+        valid_flag = num_lidar_pts >= 1
     else:
         gt_boxes = np.zeros((0, 7))
-
-    full_lidar_path = osp.join(root_path, 'vehicle-side', info['lidar_path'])
-    if len(gt_boxes) > 0:
-        num_lidar_pts = compute_num_lidar_pts_per_box(full_lidar_path, gt_boxes, load_dim=4)
-        valid_flag = num_lidar_pts > 0
-    else:
-        num_lidar_pts = np.zeros((0,), dtype=np.int64)
-        valid_flag = np.zeros((0,), dtype=bool)
+        valid_flag = np.array([], dtype=bool)
+        num_lidar_pts = np.array([], dtype=np.int64)
 
     names = np.array([b.name for b in boxes])
     visibility_tokens = np.array([b.visibility for b in boxes])
-    gt_velocity = np.array([b.gt_velocity for b in boxes])
+    # 套用 vis_gt：velocity 已在 lidar 下，直接使用
+    gt_velocity = np.array([b.gt_velocity for b in boxes], dtype=np.float32)
 
     attributes, attribute_tokens = [], []
     for name, vel, vis, valid in zip(names, gt_velocity, visibility_tokens, valid_flag):
@@ -1850,8 +1871,8 @@ if __name__ == "__main__":
     else:
         print('not prepare trajectory forecasting data')
 
+    # spd_to_uniad: 只生成 uniad 格式，不生成 pkl（pkl 由 spd_to_nuscenes 生成）
     if v2x_side == 'cooperative':
-        # generate_json_maps_files(data_root, version=v2x_side)
         total_annotations, sample_info_mappings, spd_infos = create_spd_infos_coop(
             data_root,
             save_root,
@@ -1862,9 +1883,9 @@ if __name__ == "__main__":
             version=args.version,
             max_sweeps=10,
             forecasting=forecasting,
-            max_workers=args.max_workers)
+            max_workers=args.max_workers,
+            flag_save=False)
     else:
-        # generate_json_maps_files(data_root, version=v2x_side)
         total_annotations, sample_info_mappings, spd_infos = create_spd_infos(
             data_root,
             save_root,
@@ -1874,4 +1895,5 @@ if __name__ == "__main__":
             version=args.version,
             max_sweeps=10,
             forecasting=forecasting,
-            max_workers=args.max_workers)
+            max_workers=args.max_workers,
+            flag_save=False)

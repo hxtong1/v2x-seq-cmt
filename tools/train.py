@@ -7,6 +7,15 @@ import time
 import warnings
 from os import path as osp
 
+# Fix CmtDetector registration
+import sys
+sys.path.insert(0, '/home/thx/data-mnt/code/CMT')
+from mmdet3d.models.builder import DETECTORS
+from projects.mmdet3d_plugin.models.detectors.cmt import CmtDetector
+
+# 手动注册 CmtDetector
+DETECTORS.register_module()(CmtDetector)
+
 # Suppress noisy stderr (e.g. spconv GPU arch) and common warnings; install early.
 def _install_suppress():
     try:

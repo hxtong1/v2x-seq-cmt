@@ -8,20 +8,6 @@ from torch import nn, Tensor
 from mmdet3d.registry import MODELS
 from mmcv.cnn import Scale
 
-from enum import IntEnum
-
-class BBox3DIndex(IntEnum):
-    X = 0
-    Y = 1
-    Z = 2
-    L = 3
-    W = 4
-    H = 5
-    SIN_YAW = 6
-    COS_YWA = 7
-
-    VX = 8
-    VY = 9
 @MODELS.register_module()
 class InstanceBank(nn.Module):
 
@@ -185,24 +171,6 @@ class TemporalInstanceBank(InstanceBank):
                 self.test_temp_info = self._generate_init_temp_info(bs, self.num_temp_instances, device)
             return self.test_temp_info
     
-    def update_queries_onnx(self, temp_queries: Tensor, metainfo: Dict):
-        last2curr = metainfo['last2curr']
-        last_position = temp_queries[..., [X, Y, Z]]
-        curr_position = last_position @ last2curr[:, :3, :3].transpose(1, 2) + \
-            last2curr[:, :3, 3].unsqueeze(1)
-        if self.with_motion:
-              last_velocities = torch.cat([temp_queries[..., [VX, VY]], torch.zeros_like(temp_queries[..., [0]])], dim=-1)
-              curr_velocities = last_velocities @ last2curr[:, :3, :3].transpose(1, 2)  # [bs, num_temp_instances, 3]
-              curr_position = curr_position + curr_velocities * metainfo['frame_time_gap'].unsqueeze(1)
-        src_sin_yaw = temp_queries[..., [SIN_YAW]]
-        src_cos_yaw = temp_queries[..., [COS_YAW]]
-        curr_sin_yaw, curr_cos_yaw = self.get_tgt_frame_yaw(src_sin_yaw, src_cos_yaw, last2curr[:, :3, :3])
-        temp_queries = [curr_position, temp_queries[..., [L, W, H]], curr_sin_yaw, curr_cos_yaw]
-        if self.with_motion:
-            temp_queries.append(curr_velocities[..., :2])
-
-        curr_queries = torch.cat(temp_queries, dim=-1)
-        return curr_queries
 
     def update_queries(self, temp_queries : Tensor, temp_info : Dict, metainfo: Dict):
         last2currs = temp_info['last2currs']
@@ -225,33 +193,6 @@ class TemporalInstanceBank(InstanceBank):
         temp_queries = torch.cat(temp_queries, dim=-1)
         return temp_queries
     
-    def get_temp_instances_onnx(
-        self,
-        metainfo: Dict[str, Tensor],
-        instance_info: Dict[str, Tensor],
-    ) -> Dict[str, Tensor]:
-        temp_info = metainfo['temporal_info']
-        split_dims = [self.query_dims, self.embed_dims, 1]
-        temp_queries, temp_instance_feats, temp_confidences = torch.split(temp_info, split_dims, dim=-1)
-        temp_queries = self.update_queries_onnx(temp_queries, metainfo)
-        last2curr = metainfo['last2curr']
-        temp_query_embeds = self.query_encoder(pos2posemb3d(temp_queries))  # [bs, num_temp_instances, embed_dims]
-        if self.use_last2curr_embedding:
-            temp_query_embeds = temp_query_embeds + self.last2curr_embedding(
-                last2curr.flatten(1)).unsqueeze(1)
-        
-        ret = dict(temp_instance_feats=temp_instance_feats,
-                    temp_query_embeds=temp_query_embeds,
-                    temp_queries=temp_queries)
-        
-        if self.use_temp_attn_mask:
-            temp_confidences = temp_confidences.squeeze(-1)
-            ret['temp_attn_mask'] = temp_confidences - 1
-            if self.temp_attn_mask_scale is not None:
-                ret['temp_attn_mask'] = self.temp_attn_mask_scale(ret['temp_attn_mask'])
-            ret['temp_confidences'] = temp_confidences
-        instance_info.update(ret)
-        return instance_info
     
     def get_temp_instances(
         self,
@@ -304,27 +245,11 @@ class TemporalInstanceBank(InstanceBank):
         return instance_info
 
     
-    def update_temp_instances_onnx(self,
-                                   instance_feats: Tensor,
-                                   queries: Tensor,
-                                   scores: Tensor,
-                                   metainfo: Dict[str, Tensor]) -> Tensor:
-        curr_info = torch.cat([queries, instance_feats, scores.unsqueeze(-1)], dim=-1)
-        temp_info = metainfo['temporal_info']
-        temp_info[:, :self.query_dims] = metainfo['temp_queries']
-        temp_info[:, -1] = temp_info[:, -1] * self.confidence_decay
-        
-        output = torch.cat([temp_info, curr_info], dim=0)
-        selected_inds = torch.topk(output[:, -1], self.num_temp_instances)[1]
-        return output[selected_inds]
-    
     def update_temp_instances(self,
                               instance_feats: Tensor,
                               queries: Tensor,
                               cls_logits: Tensor,
                               metainfo: Dict[str, Tensor]):
-        if torch.onnx.is_in_onnx_export():
-            return self.update_temp_instances_onnx(instance_feats, queries, cls_logits, metainfo)
         
         instance_feats = instance_feats.detach()  # [bs, num_queries, embed_dims]
         queries = queries.detach()  # [bs, num_queries, query_dims]

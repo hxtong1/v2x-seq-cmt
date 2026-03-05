@@ -501,6 +501,7 @@ if __name__ == "__main__":
     can_bus_root_path = ''
     info_prefix = args.info_prefix
 
+    
     if v2x_side == 'cooperative':
         print('this is cooperative!')
         total_annotations, sample_info_mappings, spd_infos = create_spd_infos_coop(data_root,
@@ -511,7 +512,7 @@ if __name__ == "__main__":
                                                                                    info_prefix,
                                                                                    version=version,
                                                                                    max_sweeps=10,
-                                                                                   flag_save=False)
+                                                                                   flag_save=True)
     else:
         print('this is single!')
         total_annotations, sample_info_mappings, spd_infos = create_spd_infos(
@@ -522,7 +523,7 @@ if __name__ == "__main__":
             info_prefix,
             version=version,
             max_sweeps=10,
-            flag_save=False)
+            flag_save=True)
 
     save_root = osp.join(args.save_root, v2x_side)
 

@@ -10,6 +10,7 @@ evaluation = dict(interval=20)
 dataset_type = 'CustomNuScenesDataset'
 data_root = '/home/thx/data-mnt/code/CMT/datasets/V2X-Seq-SPD-New/vehicle-side'
 info_path = '/home/thx/data-mnt/code/CMT/data/infos/V2X-Seq-SPD-New/vehicle-side'
+# info_path = '/home/thx/data-mnt/code/CMT/vis_gt'
 input_modality = dict(
     use_lidar=True,
     use_camera=False,
@@ -28,9 +29,12 @@ train_pipeline = [
         file_client_args=file_client_args,
         pts_root=data_root),
     dict(
-        type='LoadPointsFromMultiSweeps',
+        type='LoadPointsFromMultiSweeps_E2E',
         sweeps_num=10,
+        load_dim=5,
         use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args,
+        pts_root=data_root,
     ),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     # dict(
@@ -103,9 +107,12 @@ test_pipeline = [
         file_client_args=file_client_args,
         pts_root=data_root),
     dict(
-        type='LoadPointsFromMultiSweeps',
+        type='LoadPointsFromMultiSweeps_E2E',
         sweeps_num=10,
+        load_dim=5,
         use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args,
+        pts_root=data_root,
     ),
     dict(
         type='MultiScaleFlipAug3D',
