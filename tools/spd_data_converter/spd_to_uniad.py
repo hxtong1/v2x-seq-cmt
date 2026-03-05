@@ -687,38 +687,65 @@ def cal_ego_velocity(data_infos, sample_info_mappings, lidar_ego_global_infos):
 
 
 def _build_sweep_data_mapping(data_infos, lidar_ego_global_infos):
-    """Build {frame_id: sweep_info} with lidar_path, timestamp, lidar2ego."""
+    """Build {frame_id: sweep_info} with lidar_path, timestamp, lidar2ego, ego2global."""
     mapping = {}
     for d in data_infos:
         fid = d['frame_id']
         if fid not in lidar_ego_global_infos:
             continue
         ts = float(d.get('pointcloud_timestamp', d.get('timestamp', 0)))
-        # keep timestamp in same unit as sample_info (seconds if /1e6 was used)
+        # keep timestamp: seconds if input was us, else as-is
+        ts_sec = ts / 1e6 if ts > 1e10 else ts
         mapping[fid] = {
-            'lidar_path': d.get('pointcloud_path', d.get('lidar_path', '')).replace('.pcd', '.bin'),
-            'timestamp': ts / 1e6 if ts > 1e10 else ts,
+            'lidar_path': d.get('pointcloud_path', d.get('lidar_path', '')),
+            'timestamp': ts_sec,
+            'timestamp_us': int(ts) if ts > 1e10 else int(ts * 1e6),  # microseconds for mmdet3d
             'lidar2ego_rotation': lidar_ego_global_infos[fid]['lidar2ego_rotation'],
             'lidar2ego_translation': lidar_ego_global_infos[fid]['lidar2ego_translation'],
+            'ego2global_rotation': lidar_ego_global_infos[fid]['ego2global_rotation'],
+            'ego2global_translation': lidar_ego_global_infos[fid]['ego2global_translation'],
         }
     return mapping
 
 
-def generate_sweeps(sample_token, sample_info_mappings, data_infos_mapping, max_sweeps=10):
+def generate_sweeps(sample_token, sample_info_mappings, data_infos_mapping,
+                    lidar_ego_global_infos, max_sweeps=10):
+    """Generate sweeps in mmdet3d format: data_path, timestamp (us), sensor2lidar_rotation, sensor2lidar_translation."""
     sweeps = []
     cur_timestamp = float(sample_info_mappings[sample_token]['timestamp'])
+    cur_ts_us = int(cur_timestamp) if cur_timestamp > 1e10 else int(cur_timestamp * 1e6)
     prev_token = sample_info_mappings[sample_token]['prev']
+
+    if sample_token not in lidar_ego_global_infos:
+        return sweeps
+    kf_l2e_r = Quaternion(lidar_ego_global_infos[sample_token]['lidar2ego_rotation']).rotation_matrix
+    kf_l2e_t = np.array(lidar_ego_global_infos[sample_token]['lidar2ego_translation'])
+    kf_e2g_r = Quaternion(lidar_ego_global_infos[sample_token]['ego2global_rotation']).rotation_matrix
+    kf_e2g_t = np.array(lidar_ego_global_infos[sample_token]['ego2global_translation'])
 
     while len(sweeps) < max_sweeps and prev_token != '' and prev_token in data_infos_mapping:
         sweep_info = data_infos_mapping[prev_token]
-        ts = float(sweep_info['timestamp'])
-        rel_time = (cur_timestamp - ts) / \
-            1e6 if ts > 1e10 else (cur_timestamp - ts)
+        l2e_r_s = Quaternion(sweep_info['lidar2ego_rotation']).rotation_matrix
+        l2e_t_s = np.array(sweep_info['lidar2ego_translation'])
+        e2g_r_s = Quaternion(sweep_info['ego2global_rotation']).rotation_matrix
+        e2g_t_s = np.array(sweep_info['ego2global_translation'])
+
+        # sweep lidar -> keyframe lidar (same as obtain_sensor2top in uniad_nuscenes_converter)
+        R = (l2e_r_s.T @ e2g_r_s.T) @ (np.linalg.inv(kf_e2g_r).T @ np.linalg.inv(kf_l2e_r).T)
+        T = (l2e_t_s @ e2g_r_s.T + e2g_t_s) @ (np.linalg.inv(kf_e2g_r).T @ np.linalg.inv(kf_l2e_r).T)
+        T -= kf_e2g_t @ (np.linalg.inv(kf_e2g_r).T @ np.linalg.inv(kf_l2e_r).T) + kf_l2e_t @ np.linalg.inv(kf_l2e_r).T
+
+        ts_us = sweep_info.get('timestamp_us')
+        if ts_us is None:
+            ts_sec = sweep_info['timestamp']
+            ts_us = int(ts_sec * 1e6) if ts_sec < 1e10 else int(ts_sec)
+
         sweeps.append({
-            'lidar_path': sweep_info['lidar_path'].replace('.pcd', '.bin'),
-            'timestamp': rel_time,
-            'lidar2ego_rotation': sweep_info['lidar2ego_rotation'],
-            'lidar2ego_translation': sweep_info['lidar2ego_translation'],
+            'lidar_path': sweep_info['lidar_path'],
+            'data_path': sweep_info['lidar_path'],
+            'timestamp': ts_us,
+            'sensor2lidar_rotation': R.T,
+            'sensor2lidar_translation': T,
         })
         prev_token = sample_info_mappings[prev_token]['prev']
     return sweeps
@@ -1213,7 +1240,7 @@ def _process_single_frame_worker(data_info):
         'next': sample_info['next'],
     }
 
-    info['lidar_path'] = data_info['pointcloud_path'].replace('pcd', 'bin')
+    info['lidar_path'] = data_info['pointcloud_path']
     info['lidar2ego_rotation'] = lidar_ego_global_infos[sample_token]['lidar2ego_rotation']
     info['lidar2ego_translation'] = lidar_ego_global_infos[sample_token]['lidar2ego_translation']
     info['ego2global_rotation'] = lidar_ego_global_infos[sample_token]['ego2global_rotation']
@@ -1243,7 +1270,8 @@ def _process_single_frame_worker(data_info):
     calib_cam_intrinsic_path = osp.join(root_path, data_info['calib_camera_intrinsic_path'])
     info['cams'][camera_type]['cam_intrinsic'] = get_cam_intr(calib_cam_intrinsic_path)
 
-    info['sweeps'] = generate_sweeps(sample_token, sample_info_mappings, data_infos_mapping, max_sweeps=max_sweeps)
+    info['sweeps'] = generate_sweeps(sample_token, sample_info_mappings, data_infos_mapping,
+                                     lidar_ego_global_infos, max_sweeps=max_sweeps)
     info['can_bus'] = process_can_bus(info['ego2global_translation'], info['ego2global_rotation'])
 
     annotations = total_annotations[sample_token]
@@ -1360,7 +1388,7 @@ def _process_single_frame_coop_worker(coop_data_info):
     veh_data_info = veh_map[veh_frame_id]
     inf_data_info = inf_map[inf_frame_id]
 
-    info['lidar_path'] = veh_data_info['pointcloud_path'].replace('pcd', 'bin')
+    info['lidar_path'] = veh_data_info['pointcloud_path']
     info['lidar2ego_rotation'] = lidar_ego_global_infos[sample_token]['lidar2ego_rotation']
     info['lidar2ego_translation'] = lidar_ego_global_infos[sample_token]['lidar2ego_translation']
     info['ego2global_rotation'] = lidar_ego_global_infos[sample_token]['ego2global_rotation']
@@ -1426,7 +1454,8 @@ def _process_single_frame_coop_worker(coop_data_info):
         veh_data_info['calib_camera_intrinsic_path']))
 
     info['sweeps'] = generate_sweeps(
-        sample_token, sample_info_mappings, sweep_data_mapping, max_sweeps=max_sweeps)
+        sample_token, sample_info_mappings, sweep_data_mapping,
+        lidar_ego_global_infos, max_sweeps=max_sweeps)
     info['can_bus'] = process_can_bus(
         info['ego2global_translation'], info['ego2global_rotation'])
 

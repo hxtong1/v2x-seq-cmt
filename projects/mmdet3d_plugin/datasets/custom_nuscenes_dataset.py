@@ -187,10 +187,20 @@ class CustomNuScenesDataset(NuScenesDataset):
         # standard protocal modified from SECOND.Pytorch
         lidar_path = info['lidar_path']
         pts_filename = os.path.splitext(lidar_path)[0] + '.pcd'
+        # Resolve sweep data_path: mmdet3d LoadPointsFromMultiSweeps expects loadable path
+        sweeps = []
+        for sw in info['sweeps']:
+            s = dict(sw)
+            dp = s.get('data_path', s.get('lidar_path', ''))
+            if dp and not osp.isabs(dp):
+                s['data_path'] = osp.join(self.data_root, dp)
+            elif 'data_path' not in s and 'lidar_path' in s:
+                s['data_path'] = osp.join(self.data_root, s['lidar_path'])
+            sweeps.append(s)
         input_dict = dict(
             sample_idx=info['token'],
             pts_filename=pts_filename,
-            sweeps=info['sweeps'],
+            sweeps=sweeps,
             timestamp=info['timestamp'] / 1e6,
             img_sweeps=None if 'img_sweeps' not in info else info['img_sweeps'],
             radar_info=None if 'radars' not in info else info['radars']

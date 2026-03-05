@@ -18,8 +18,6 @@ from mmcv.cnn.bricks.registry import (
 )
 
 __all__ = [
-    # "DeformableFeatureAggregation",
-    # "DenseDepthNet",
     "AsymmetricFFN",
 ]
 
