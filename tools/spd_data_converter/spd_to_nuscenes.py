@@ -232,6 +232,38 @@ def generate_scene_json(sample_info_mappings, data_root, version='v1.0-mini', lo
     write_json(scene_infos, target_file_path)
 
 
+MIN_DT_US = 50000  # 0.05s，同 scene 内相邻 sample 最小时间差
+
+
+def _ensure_strictly_increasing_timestamps(image_sample_infos, sample_info_mappings):
+    """同 scene 内按 prev/next 顺序保证 timestamp 严格递增，避免 time_diff≈0 导致 box_velocity 极大"""
+    token2sample = {s['token']: s for s in image_sample_infos}
+    scenes_done = set()
+    for s in image_sample_infos:
+        sc = s['scene_token']
+        if sc in scenes_done:
+            continue
+        scenes_done.add(sc)
+        tokens_in_scene = [t for t, x in token2sample.items() if x['scene_token'] == sc]
+        first = next((t for t in tokens_in_scene if token2sample[t]['prev'] == ''), None)
+        if first is None:
+            continue
+        ordered, cur, seen = [], first, set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            ordered.append(token2sample[cur])
+            nxt = token2sample[cur]['next']
+            cur = nxt if nxt and nxt in token2sample else None
+        prev_ts = -1
+        for s in ordered:
+            ts = s['timestamp']
+            if ts <= prev_ts:
+                s['timestamp'] = prev_ts + MIN_DT_US
+                prev_ts = s['timestamp']
+            else:
+                prev_ts = ts
+
+
 # UniV2X TODO: update the image sample token generation
 # UniV2X TODO: remove the hard code about sensor_name
 # UniV2X TODO: we need consider generating different image samples by sensor json
@@ -272,13 +304,16 @@ def generate_sample_json(sample_info_mappings, data_root, version='v1.0-mini', l
         # }
         info = {
             'token': sample_token,
-            'timestamp': sample_info['image_timestamp'],
+            'timestamp': sample_info['image_timestamp'],  # vis_gt: 已在 spd_to_uniad 中规范为微秒
             'prev': sample_info['prev'],
             'next': sample_info['next'],
             'scene_token': sample_info['scene_token']
         }
 
         image_sample_infos.append(info)
+
+    # 同 scene 内保证 timestamp 严格递增，避免 time_diff≈0 导致 nusc.box_velocity 爆炸
+    _ensure_strictly_increasing_timestamps(image_sample_infos, sample_info_mappings)
 
     target_file_path = osp.join(data_root, version, 'sample.json')
     write_json(image_sample_infos, target_file_path)

@@ -1,3 +1,4 @@
 from .cmt import CmtDetector
-
-__all__ = ['CmtDetector']
+from .cmt_tracker import CMTCoopTracker
+# from .cooptrack import CoopTrack
+__all__ = ['CmtDetector', 'CMTCoopTracker']

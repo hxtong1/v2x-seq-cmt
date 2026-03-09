@@ -22,6 +22,7 @@ from nuscenes.eval.common.loaders import (
     add_center_dist,
     filter_eval_boxes,
 )
+from nuscenes.eval.common.utils import Quaternion, quaternion_yaw
 from nuscenes.eval.common.data_classes import EvalBoxes
 from nuscenes.eval.detection.data_classes import DetectionBox
 from nuscenes.eval.detection.utils import category_to_detection_name
@@ -49,6 +50,73 @@ class _DetectionEvalFromBoxes(DetectionEval):
         self.meta = meta
 
 
+def _load_gt_from_data_infos(dataset, sample_tokens, box_cls=DetectionBox, verbose=False):
+    """Load GT from dataset.data_infos (pkl) with correct gt_velocity, bypassing nusc.box_velocity.
+    nusc.box_velocity 对 prev/next 链错误的 ann 会返回极大值，改用 pkl 的 gt_velocity（lidar 转 global）。
+    """
+    from pyquaternion import Quaternion
+    import numpy as np
+
+    token2info = {info['token']
+        : info for info in dataset.data_infos if 'token' in info}
+    all_annotations = EvalBoxes()
+    for sample_token in sample_tokens:
+        info = token2info.get(sample_token)
+        if info is None or 'gt_boxes' not in info:
+            continue
+        gt_boxes = np.array(info['gt_boxes'])
+        gt_names = np.array(info['gt_names'])
+        gt_velocity = np.array(
+            info.get('gt_velocity', np.zeros((len(gt_boxes), 2))))
+        if len(gt_velocity) != len(gt_boxes):
+            gt_velocity = np.zeros((len(gt_boxes), 2))
+        l2e_r = Quaternion(info['lidar2ego_rotation']).rotation_matrix
+        l2e_t = np.array(info['lidar2ego_translation'])
+        e2g_r = Quaternion(info['ego2global_rotation']).rotation_matrix
+        e2g_t = np.array(info['ego2global_translation'])
+        sample_boxes = []
+        for i in range(len(gt_boxes)):
+            cx, cy, cz = gt_boxes[i, :3]
+            w, l, h = gt_boxes[i, 3:6]
+            rot = gt_boxes[i, 6]
+            vx, vy = float(gt_velocity[i, 0]), float(gt_velocity[i, 1])
+            vel_lidar = np.array([vx, vy, 0.0])
+            vel_global = (e2g_r @ l2e_r @ vel_lidar)[:2]
+            center_ego = l2e_r @ np.array([cx, cy, cz]) + l2e_t
+            center_global = (e2g_r @ center_ego + e2g_t).tolist()
+            q_lidar = Quaternion(axis=[0, 0, 1], angle=float(rot))
+            q_global = Quaternion(e2g_r) * Quaternion(l2e_r) * q_lidar
+            size_wlh = [float(w), float(l), float(h)]
+            detection_name = str(gt_names[i]) if gt_names[i] in (
+                'car', 'truck', 'bus', 'trailer', 'construction_vehicle',
+                'pedestrian', 'bicycle', 'motorcycle', 'barrier', 'traffic_cone') else None
+            if detection_name is None:
+                continue
+            nl = info.get('num_lidar_pts', np.zeros(len(gt_boxes)))
+            nr = info.get('num_radar_pts', np.zeros(len(gt_boxes)))
+            num_pts = int(nl[i] if hasattr(nl, '__getitem__') else 0) + \
+                int(nr[i] if hasattr(nr, '__getitem__') else 0)
+            sample_boxes.append(
+                box_cls(
+                    sample_token=sample_token,
+                    translation=center_global,
+                    size=size_wlh,
+                    rotation=q_global.elements.tolist(),
+                    velocity=vel_global.tolist(),
+                    num_pts=num_pts,
+                    detection_name=detection_name,
+                    detection_score=-1.0,
+                    attribute_name='',
+                )
+            )
+        if sample_boxes:
+            all_annotations.add_boxes(sample_token, sample_boxes)
+    if verbose:
+        print('Loaded GT from data_infos for {} samples.'.format(
+            len(all_annotations.sample_tokens)))
+    return all_annotations
+
+
 def _load_gt_for_sample_tokens(nusc, sample_tokens, box_cls=DetectionBox, verbose=False):
     """Load GT from nusc for the given sample_tokens (no split filter).
 
@@ -66,13 +134,14 @@ def _load_gt_for_sample_tokens(nusc, sample_tokens, box_cls=DetectionBox, verbos
         sample_annotation_tokens = sample['anns']
         sample_boxes = []
         for sample_annotation_token in sample_annotation_tokens:
-            sample_annotation = nusc.get('sample_annotation', sample_annotation_token)
+            sample_annotation = nusc.get(
+                'sample_annotation', sample_annotation_token)
             cat_name = sample_annotation['category_name']
             detection_name = category_to_detection_name(cat_name)
             if detection_name is None:
                 # SPD and similar use short names (car, pedestrian); accept them.
                 if cat_name in ('car', 'truck', 'bus', 'trailer', 'construction_vehicle',
-                               'pedestrian', 'bicycle', 'motorcycle', 'barrier', 'traffic_cone'):
+                                'pedestrian', 'bicycle', 'motorcycle', 'barrier', 'traffic_cone'):
                     detection_name = cat_name
                 else:
                     continue
@@ -91,7 +160,8 @@ def _load_gt_for_sample_tokens(nusc, sample_tokens, box_cls=DetectionBox, verbos
                     size=sample_annotation['size'],
                     rotation=sample_annotation['rotation'],
                     velocity=nusc.box_velocity(sample_annotation['token'])[:2],
-                    num_pts=sample_annotation['num_lidar_pts'] + sample_annotation['num_radar_pts'],
+                    num_pts=sample_annotation['num_lidar_pts'] +
+                    sample_annotation['num_radar_pts'],
                     detection_name=detection_name,
                     detection_score=-1.0,
                     attribute_name=attribute_name,
@@ -150,7 +220,8 @@ class CustomNuScenesDataset(NuScenesDataset):
                 annos['gt_bboxes_3d'] = LiDARInstance3DBoxes(
                     np.zeros((0, box_dim), dtype=np.float32), box_dim=box_dim)
             else:
-                annos['gt_bboxes_3d'] = np.zeros((0, annos['gt_bboxes_3d'].shape[1]), dtype=np.float32)
+                annos['gt_bboxes_3d'] = np.zeros(
+                    (0, annos['gt_bboxes_3d'].shape[1]), dtype=np.float32)
             return annos
         keep = np.asarray(keep)
         annos['gt_labels_3d'] = np.array(new_labels, dtype=np.int64)
@@ -197,14 +268,52 @@ class CustomNuScenesDataset(NuScenesDataset):
             elif 'data_path' not in s and 'lidar_path' in s:
                 s['data_path'] = osp.join(self.data_root, s['lidar_path'])
             sweeps.append(s)
+        if 'token_inf' in info:
+            token_inf = info['token_inf']
+        else:
+            token_inf = -1
         input_dict = dict(
             sample_idx=info['token'],
+            sample_idx_inf=token_inf,
             pts_filename=pts_filename,
             sweeps=sweeps,
+            ego2global_translation=info['ego2global_translation'],
+            ego2global_rotation=info['ego2global_rotation'],
+            prev_idx=info['prev'],
+            next_idx=info['next'],
+            scene_token=info['scene_token'],
+            can_bus=info['can_bus'],
+            frame_idx=info['frame_idx'],
             timestamp=info['timestamp'] / 1e6,
             img_sweeps=None if 'img_sweeps' not in info else info['img_sweeps'],
             radar_info=None if 'radars' not in info else info['radars']
         )
+        l2e_r = info['lidar2ego_rotation']
+        l2e_t = info['lidar2ego_translation']
+        e2g_r = info['ego2global_rotation']
+        e2g_t = info['ego2global_translation']
+        l2e_r_mat = Quaternion(l2e_r).rotation_matrix
+        e2g_r_mat = Quaternion(e2g_r).rotation_matrix
+
+        l2g_r_mat = l2e_r_mat.T @ e2g_r_mat.T
+        l2g_t = l2e_t @ e2g_r_mat.T + e2g_t
+
+        input_dict.update(
+            dict(
+                l2g_r_mat=l2g_r_mat.astype(np.float32),
+                l2g_t=l2g_t.astype(np.float32)))
+
+        if 'VehLidar2InfLidar_rotation' in info:
+            veh2inf_r = info['VehLidar2InfLidar_rotation']
+        if 'VehLidar2InfLidar_translation' in info:
+            veh2inf_t = info['VehLidar2InfLidar_translation']
+
+        veh2inf_rt = np.eye(4)
+        if 'VehLidar2InfLidar_rotation' in info and 'VehLidar2InfLidar_translation' in info:
+            veh2inf_rt[:3, :3] = veh2inf_r
+            veh2inf_rt[:3, 3] = veh2inf_t
+            veh2inf_rt = veh2inf_rt.T
+        input_dict.update(dict(veh2inf_rt=veh2inf_rt.astype(np.float32)))
 
         if self.return_gt_info:
             input_dict['info'] = info
@@ -296,7 +405,8 @@ class CustomNuScenesDataset(NuScenesDataset):
                 self.eval_detection_configs.max_boxes_per_sample,
                 DetectionBox,
                 verbose=False)
-            gt_boxes_full = load_gt(nusc, eval_set, DetectionBox, verbose=False)
+            gt_boxes_full = load_gt(
+                nusc, eval_set, DetectionBox, verbose=False)
         except Exception:
             return self._evaluate_single_fallback(result_name)
 
@@ -322,6 +432,13 @@ class CustomNuScenesDataset(NuScenesDataset):
                         'Custom split has no sample_tokens in common with '
                         'nuScenes DB. Skipping NuScenes metrics.')
                 return self._evaluate_single_fallback(result_name)
+
+        # 优先用 data_infos (pkl) 的 GT，避免 nusc.box_velocity 对 prev/next 链错误 ann 返回极大 velocity
+        if hasattr(self, 'data_infos') and self.data_infos and len(common) > 0:
+            gt_from_pkl = _load_gt_from_data_infos(
+                self, list(common), DetectionBox, verbose=False)
+            if gt_from_pkl.sample_tokens:
+                gt_boxes_full = gt_from_pkl
 
         # Filter to common sample_tokens so pred and gt match
         pred_filtered = EvalBoxes()

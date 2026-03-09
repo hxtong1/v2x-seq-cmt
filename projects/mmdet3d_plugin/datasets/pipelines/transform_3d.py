@@ -5,6 +5,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 # ------------------------------------------------------------------------
 
+from mmdet3d.core.bbox import LiDARInstance3DBoxes, DepthInstance3DBoxes, CameraInstance3DBoxes
 import numpy as np
 from numpy import random
 import torch
@@ -14,6 +15,8 @@ import cv2
 from mmcv.utils import build_from_cfg
 from mmdet.datasets.builder import PIPELINES
 from mmdet.datasets.pipelines import RandomFlip
+from mmdet3d.datasets.pipelines import ObjectRangeFilter, ObjectNameFilter
+from mmcv.parallel import DataContainer as DC
 from mmdet3d.core.bbox import box_np_ops
 from mmdet3d.datasets.builder import OBJECTSAMPLERS
 
@@ -185,18 +188,19 @@ class UnifiedObjectSample(object):
             # check the points dimension
             # points = points.cat([sampled_points, points])
             points = points.cat([points, sampled_points])
-            points_idx = np.concatenate([points_idx, sampled_points_idx], axis=0)
+            points_idx = np.concatenate(
+                [points_idx, sampled_points_idx], axis=0)
 
             if self.sample_2d:
                 imgs = input_dict['img']
                 lidar2img = input_dict['lidar2img']
                 sampled_img = sampled_dict['images']
                 sampled_num = len(sampled_gt_bboxes_3d)
-                imgs, points_keep = self.unified_sample(imgs, lidar2img, 
-                                            points.tensor.numpy(), 
-                                            points_idx, gt_bboxes_3d.corners.numpy(), 
-                                            sampled_img, sampled_num)
-                
+                imgs, points_keep = self.unified_sample(imgs, lidar2img,
+                                                        points.tensor.numpy(),
+                                                        points_idx, gt_bboxes_3d.corners.numpy(),
+                                                        sampled_img, sampled_num)
+
                 input_dict['img'] = imgs
 
                 if self.modify_points:
@@ -210,34 +214,37 @@ class UnifiedObjectSample(object):
 
     def unified_sample(self, imgs, lidar2img, points, points_idx, bboxes_3d, sampled_img, sampled_num):
         # for boxes
-        bboxes_3d = np.concatenate([bboxes_3d, np.ones_like(bboxes_3d[..., :1])], -1)
+        bboxes_3d = np.concatenate(
+            [bboxes_3d, np.ones_like(bboxes_3d[..., :1])], -1)
         is_raw = np.ones(len(bboxes_3d))
         is_raw[-sampled_num:] = 0
         is_raw = is_raw.astype(bool)
         raw_num = len(is_raw)-sampled_num
         # for point cloud
-        points_3d = points[:,:4].copy()
-        points_3d[:,-1] = 1
+        points_3d = points[:, :4].copy()
+        points_3d[:, -1] = 1
         points_keep = np.ones(len(points_3d)).astype(np.bool)
         new_imgs = imgs
 
-        assert len(imgs)==len(lidar2img) and len(sampled_img)==sampled_num
+        assert len(imgs) == len(lidar2img) and len(sampled_img) == sampled_num
         for _idx, (_img, _lidar2img) in enumerate(zip(imgs, lidar2img)):
             coord_img = bboxes_3d @ _lidar2img.T
-            coord_img[...,:2] /= coord_img[...,2,None]
-            depth = coord_img[...,2]
+            coord_img[..., :2] /= coord_img[..., 2, None]
+            depth = coord_img[..., 2]
             img_mask = (depth > 0).all(axis=-1)
             img_count = img_mask.nonzero()[0]
             if img_mask.sum() == 0:
                 continue
             depth = depth.mean(1)[img_mask]
-            coord_img = coord_img[...,:2][img_mask]
+            coord_img = coord_img[..., :2][img_mask]
             minxy = np.min(coord_img, axis=-2)
             maxxy = np.max(coord_img, axis=-2)
             bbox = np.concatenate([minxy, maxxy], axis=-1).astype(int)
-            bbox[:,0::2] = np.clip(bbox[:,0::2], a_min=0, a_max=_img.shape[1]-1)
-            bbox[:,1::2] = np.clip(bbox[:,1::2], a_min=0, a_max=_img.shape[0]-1)
-            img_mask = ((bbox[:,2:]-bbox[:,:2]) > 1).all(axis=-1)
+            bbox[:, 0::2] = np.clip(
+                bbox[:, 0::2], a_min=0, a_max=_img.shape[1]-1)
+            bbox[:, 1::2] = np.clip(
+                bbox[:, 1::2], a_min=0, a_max=_img.shape[0]-1)
+            img_mask = ((bbox[:, 2:]-bbox[:, :2]) > 1).all(axis=-1)
             if img_mask.sum() == 0:
                 continue
             depth = depth[img_mask]
@@ -255,46 +262,55 @@ class UnifiedObjectSample(object):
             raw_img = []
             for _count, _box in zip(img_count, bbox):
                 if is_raw[_count]:
-                    raw_img.append(_img[_box[1]:_box[3],_box[0]:_box[2]])
+                    raw_img.append(_img[_box[1]:_box[3], _box[0]:_box[2]])
 
             # then stitch the crops to raw image
             for _count, _box in zip(img_count, bbox):
                 if is_raw[_count]:
                     if self.mixup_rate < 0:
-                        _img[_box[1]:_box[3],_box[0]:_box[2]] = raw_img.pop(0)
+                        _img[_box[1]:_box[3], _box[0]:_box[2]] = raw_img.pop(0)
                     else:
-                        _img[_box[1]:_box[3],_box[0]:_box[2]] = \
-                            _img[_box[1]:_box[3],_box[0]:_box[2]] * (1 - self.mixup_rate) + raw_img.pop(0) * self.mixup_rate
-                    fg_mask[_box[1]:_box[3],_box[0]:_box[2]] = 1
+                        _img[_box[1]:_box[3], _box[0]:_box[2]] = \
+                            _img[_box[1]:_box[3], _box[0]:_box[2]] * \
+                            (1 - self.mixup_rate) + \
+                            raw_img.pop(0) * self.mixup_rate
+                    fg_mask[_box[1]:_box[3], _box[0]:_box[2]] = 1
                 else:
                     img_crop = sampled_img[_count-raw_num]
-                    if len(img_crop)==0: continue
-                    img_crop = cv2.resize(img_crop, tuple(_box[[2,3]]-_box[[0,1]]))
+                    if len(img_crop) == 0:
+                        continue
+                    img_crop = cv2.resize(
+                        img_crop, tuple(_box[[2, 3]]-_box[[0, 1]]))
                     if self.mixup_rate < 0:
-                        _img[_box[1]:_box[3],_box[0]:_box[2]] = img_crop
+                        _img[_box[1]:_box[3], _box[0]:_box[2]] = img_crop
                     else:
-                        _img[_box[1]:_box[3],_box[0]:_box[2]] = \
-                            _img[_box[1]:_box[3],_box[0]:_box[2]] * (1 - self.mixup_rate) + img_crop * self.mixup_rate
+                        _img[_box[1]:_box[3], _box[0]:_box[2]] = \
+                            _img[_box[1]:_box[3], _box[0]:_box[2]] * \
+                            (1 - self.mixup_rate) + img_crop * self.mixup_rate
 
-                paste_mask[_box[1]:_box[3],_box[0]:_box[2]] = _count
-            
+                paste_mask[_box[1]:_box[3], _box[0]:_box[2]] = _count
+
             new_imgs[_idx] = _img
 
             # calculate modify mask
             if self.modify_points:
                 points_img = points_3d @ _lidar2img.T
-                points_img[:,:2] /= points_img[:,2,None]
-                depth = points_img[:,2]
+                points_img[:, :2] /= points_img[:, 2, None]
+                depth = points_img[:, 2]
                 img_mask = depth > 0
                 if img_mask.sum() == 0:
                     continue
-                img_mask = (points_img[:,0] > 0) & (points_img[:,0] < _img.shape[1]) & \
-                           (points_img[:,1] > 0) & (points_img[:,1] < _img.shape[0]) & img_mask
+                img_mask = (points_img[:, 0] > 0) & (points_img[:, 0] < _img.shape[1]) & \
+                           (points_img[:, 1] > 0) & (
+                               points_img[:, 1] < _img.shape[0]) & img_mask
                 points_img = points_img[img_mask].astype(int)
-                new_mask = paste_mask[points_img[:,1], points_img[:,0]]==(points_idx[img_mask]+raw_num)
-                raw_fg = (fg_mask == 1) & (paste_mask >= 0) & (paste_mask < raw_num)
+                new_mask = paste_mask[points_img[:, 1], points_img[:, 0]] == (
+                    points_idx[img_mask]+raw_num)
+                raw_fg = (fg_mask == 1) & (
+                    paste_mask >= 0) & (paste_mask < raw_num)
                 raw_bg = (fg_mask == 0) & (paste_mask < 0)
-                raw_mask = raw_fg[points_img[:,1], points_img[:,0]] | raw_bg[points_img[:,1], points_img[:,0]]
+                raw_mask = raw_fg[points_img[:, 1], points_img[:, 0]
+                                  ] | raw_bg[points_img[:, 1], points_img[:, 0]]
                 keep_mask = new_mask | raw_mask
                 points_keep[img_mask] = points_keep[img_mask] & keep_mask
 
@@ -324,7 +340,6 @@ class ResizeCropFlipImage(object):
         self.data_aug_conf = data_aug_conf
         self.training = training
         self.pic_wise = pic_wise
-        
 
     def __call__(self, results):
         """Call function to pad images, masks, semantic segmentation maps.
@@ -370,12 +385,15 @@ class ResizeCropFlipImage(object):
                 new_depths.append(depth.astype(np.float32))
 
             new_imgs.append(img)
-            results['cam_intrinsic'][i][:2, :3] = post_rot2 @ results['cam_intrinsic'][i][:2, :3]
-            results['cam_intrinsic'][i][:2, 2] = post_tran2 + results['cam_intrinsic'][i][:2, 2]
+            results['cam_intrinsic'][i][:2,
+                                        :3] = post_rot2 @ results['cam_intrinsic'][i][:2, :3]
+            results['cam_intrinsic'][i][:2, 2] = post_tran2 + \
+                results['cam_intrinsic'][i][:2, 2]
 
         results["img"] = new_imgs
         results["depths"] = new_depths
-        results['lidar2img'] = [results['cam_intrinsic'][i] @ results['lidar2cam'][i] for i in range(len(results['lidar2cam']))]
+        results['lidar2img'] = [results['cam_intrinsic'][i] @
+                                results['lidar2cam'][i] for i in range(len(results['lidar2cam']))]
 
         return results
 
@@ -392,10 +410,10 @@ class ResizeCropFlipImage(object):
         # adjust image
         resized_img = cv2.resize(img, resize_dims)
         img = np.zeros((crop[3] - crop[1], crop[2] - crop[0], 3))
-        
+
         hsize, wsize = crop[3] - crop[1], crop[2] - crop[0]
         dh, dw, sh, sw = crop[1], crop[0], 0, 0
-        
+
         if dh < 0:
             sh = -dh
             hsize += dh
@@ -408,8 +426,9 @@ class ResizeCropFlipImage(object):
             dw = 0
         if dw + wsize > resized_img.shape[1]:
             wsize = resized_img.shape[1] - dw
-        img[sh : sh + hsize, sw : sw + wsize] = resized_img[dh: dh + hsize, dw: dw + wsize]
-        
+        img[sh: sh + hsize, sw: sw +
+            wsize] = resized_img[dh: dh + hsize, dw: dw + wsize]
+
         (h, w) = img.shape[:2]
         center = (w / 2, h / 2)
         if flip:
@@ -439,7 +458,8 @@ class ResizeCropFlipImage(object):
             resize = np.random.uniform(*self.data_aug_conf["resize_lim"])
             resize_dims = (int(W * resize), int(H * resize))
             newW, newH = resize_dims
-            crop_h = int((1 - np.random.uniform(*self.data_aug_conf["bot_pct_lim"])) * newH) - fH
+            crop_h = int(
+                (1 - np.random.uniform(*self.data_aug_conf["bot_pct_lim"])) * newH) - fH
             crop_w = int(np.random.uniform(0, max(0, newW - fW)))
             crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
             flip = False
@@ -450,7 +470,8 @@ class ResizeCropFlipImage(object):
             resize = max(fH / H, fW / W)
             resize_dims = (int(W * resize), int(H * resize))
             newW, newH = resize_dims
-            crop_h = int((1 - np.mean(self.data_aug_conf["bot_pct_lim"])) * newH) - fH
+            crop_h = int(
+                (1 - np.mean(self.data_aug_conf["bot_pct_lim"])) * newH) - fH
             crop_w = int(max(0, newW - fW) / 2)
             crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
             flip = False
@@ -499,7 +520,8 @@ class ResizeCropFlipImage(object):
             & (depth_coords[:, 1] >= 0)
             & (depth_coords[:, 0] >= 0)
         )
-        depth_map[depth_coords[valid_mask, 1], depth_coords[valid_mask, 0], :] = cam_depth[valid_mask, :]
+        depth_map[depth_coords[valid_mask, 1],
+                  depth_coords[valid_mask, 0], :] = cam_depth[valid_mask, :]
 
         return depth_map
 
@@ -562,7 +584,7 @@ class GlobalRotScaleTransAll(object):
         """
         translation_std = np.array(self.translation_std, dtype=np.float32)
         trans_factor = np.random.normal(scale=translation_std, size=3).T
-        
+
         input_dict['points'].translate(trans_factor)
         if 'radar' in input_dict:
             input_dict['radar'].translate(trans_factor)
@@ -611,8 +633,10 @@ class GlobalRotScaleTransAll(object):
             rot_mat[0, 1], rot_mat[1, 0] = -rot_mat[0, 1], -rot_mat[1, 0]
             rot_mat_inv = torch.inverse(rot_mat)
             for view in range(len(input_dict["lidar2img"])):
-                input_dict["lidar2img"][view] = (torch.tensor(input_dict["lidar2img"][view]).float() @ rot_mat_inv).numpy()
-                input_dict["lidar2cam"][view] = (torch.tensor(input_dict["lidar2cam"][view]).float() @ rot_mat_inv).numpy()
+                input_dict["lidar2img"][view] = (torch.tensor(
+                    input_dict["lidar2img"][view]).float() @ rot_mat_inv).numpy()
+                input_dict["lidar2cam"][view] = (torch.tensor(
+                    input_dict["lidar2cam"][view]).float() @ rot_mat_inv).numpy()
             return
 
         # rotate points with bboxes
@@ -630,9 +654,10 @@ class GlobalRotScaleTransAll(object):
                 rot_mat[0, 1], rot_mat[1, 0] = -rot_mat[0, 1], -rot_mat[1, 0]
                 rot_mat_inv = torch.inverse(rot_mat)
                 for view in range(len(input_dict["lidar2img"])):
-                    input_dict["lidar2img"][view] = (torch.tensor(input_dict["lidar2img"][view]).float() @ rot_mat_inv).numpy()
-                    input_dict["lidar2cam"][view] = (torch.tensor(input_dict["lidar2cam"][view]).float() @ rot_mat_inv).numpy()
-
+                    input_dict["lidar2img"][view] = (torch.tensor(
+                        input_dict["lidar2img"][view]).float() @ rot_mat_inv).numpy()
+                    input_dict["lidar2cam"][view] = (torch.tensor(
+                        input_dict["lidar2cam"][view]).float() @ rot_mat_inv).numpy()
 
     def _scale_bbox_points(self, input_dict):
         """Private function to scale bounding boxes and points.
@@ -652,10 +677,10 @@ class GlobalRotScaleTransAll(object):
                 'setting shift_height=True but points have no height attribute'
             points.tensor[:, points.attribute_dims['height']] *= scale
         input_dict['points'] = points
-        
+
         if 'radar' in input_dict:
             input_dict['radar'].scale(scale)
-            
+
         for key in input_dict['bbox3d_fields']:
             input_dict[key].scale(scale)
 
@@ -669,8 +694,10 @@ class GlobalRotScaleTransAll(object):
         )
         scale_mat_inv = torch.inverse(scale_mat)
         for view in range(len(input_dict["lidar2img"])):
-            input_dict["lidar2img"][view] = (torch.tensor(input_dict["lidar2img"][view]).float() @ scale_mat_inv).numpy()
-            input_dict["lidar2cam"][view] = (torch.tensor(input_dict["lidar2cam"][view]).float() @ scale_mat_inv).numpy()
+            input_dict["lidar2img"][view] = (torch.tensor(
+                input_dict["lidar2img"][view]).float() @ scale_mat_inv).numpy()
+            input_dict["lidar2cam"][view] = (torch.tensor(
+                input_dict["lidar2cam"][view]).float() @ scale_mat_inv).numpy()
 
     def _random_scale(self, input_dict):
         """Private function to randomly set the scale factor.
@@ -882,7 +909,7 @@ class GlobalRotScaleTransImage(object):
 
         self.reverse_angle = reverse_angle
         self.training = training
-        
+
         self.flip_dx_ratio = flip_dx_ratio
         self.flip_dy_ratio = flip_dy_ratio
 
@@ -918,13 +945,16 @@ class GlobalRotScaleTransImage(object):
         rot_cos = torch.cos(torch.tensor(angle))
         rot_sin = torch.sin(torch.tensor(angle))
 
-        rot_mat = torch.tensor([[rot_cos, -rot_sin, 0, 0], [rot_sin, rot_cos, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+        rot_mat = torch.tensor(
+            [[rot_cos, -rot_sin, 0, 0], [rot_sin, rot_cos, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
         rot_mat_inv = torch.inverse(rot_mat)
 
         num_view = len(results["lidar2img"])
         for view in range(num_view):
-            results["lidar2img"][view] = (torch.tensor(results["lidar2img"][view]).float() @ rot_mat_inv).numpy()
-            results["lidar2cam"][view] = (torch.tensor(results["lidar2cam"][view]).float() @ rot_mat_inv).numpy()
+            results["lidar2img"][view] = (torch.tensor(
+                results["lidar2img"][view]).float() @ rot_mat_inv).numpy()
+            results["lidar2cam"][view] = (torch.tensor(
+                results["lidar2cam"][view]).float() @ rot_mat_inv).numpy()
 
         return
 
@@ -942,8 +972,10 @@ class GlobalRotScaleTransImage(object):
 
         num_view = len(results["lidar2img"])
         for view in range(num_view):
-            results["lidar2img"][view] = (torch.tensor(results["lidar2img"][view]).float() @ rot_mat_inv).numpy()
-            results["lidar2cam"][view] = (torch.tensor(results["lidar2cam"][view]).float() @ rot_mat_inv).numpy()
+            results["lidar2img"][view] = (torch.tensor(
+                results["lidar2img"][view]).float() @ rot_mat_inv).numpy()
+            results["lidar2cam"][view] = (torch.tensor(
+                results["lidar2cam"][view]).float() @ rot_mat_inv).numpy()
         return
 
     def flip_xy(self, results):
@@ -961,9 +993,367 @@ class GlobalRotScaleTransImage(object):
         if np.random.rand() < self.flip_dy_ratio:
             mat[1][1] = -1
             results["gt_bboxes_3d"].flip(bev_direction='horizontal')
-            
+
         num_view = len(results['lidar2img'])
         for view in range(num_view):
-            results["lidar2img"][view] = (torch.tensor(results["lidar2img"][view]).float() @ mat.float()).numpy()
-            results["lidar2cam"][view] = (torch.tensor(results["lidar2cam"][view]).float() @ mat.float()).numpy()
+            results["lidar2img"][view] = (torch.tensor(
+                results["lidar2img"][view]).float() @ mat.float()).numpy()
+            results["lidar2cam"][view] = (torch.tensor(
+                results["lidar2cam"][view]).float() @ mat.float()).numpy()
         return
+
+
+@PIPELINES.register_module()
+class ObjectRangeFilter_Track(object):
+    """Filter objects by the range, keeping tracking IDs intact."""
+
+    def __init__(self, point_cloud_range):
+        self.pcd_range = np.array(point_cloud_range, dtype=np.float32)
+
+    def __call__(self, input_dict):
+        if isinstance(input_dict['gt_bboxes_3d'],
+                      (LiDARInstance3DBoxes, DepthInstance3DBoxes)):
+            bev_range = self.pcd_range[[0, 1, 3, 4]]
+        elif isinstance(input_dict['gt_bboxes_3d'], CameraInstance3DBoxes):
+            bev_range = self.pcd_range[[0, 2, 3, 5]]
+
+        gt_bboxes_3d = input_dict['gt_bboxes_3d']
+        gt_labels_3d = input_dict['gt_labels_3d']
+        mask = gt_bboxes_3d.in_range_bev(bev_range)
+        gt_bboxes_3d = gt_bboxes_3d[mask]
+        gt_labels_3d = gt_labels_3d[mask.numpy().astype(np.bool_)]
+
+        gt_bboxes_3d.limit_yaw(offset=0.5, period=2 * np.pi)
+        input_dict['gt_bboxes_3d'] = gt_bboxes_3d
+        input_dict['gt_labels_3d'] = gt_labels_3d
+
+        if 'gt_inds' in input_dict:
+            input_dict['gt_inds'] = input_dict['gt_inds'][mask.numpy().astype(
+                np.bool_)]
+
+        return input_dict
+
+
+@PIPELINES.register_module()
+class ObjectNameFilter_Track(object):
+    """Filter GT objects by their names, keeping tracking IDs intact."""
+
+    def __init__(self, classes):
+        self.classes = classes
+        self.labels = list(range(len(self.classes)))
+
+    def __call__(self, input_dict):
+        gt_labels_3d = input_dict['gt_labels_3d']
+        gt_bboxes_mask = np.array([n in self.labels for n in gt_labels_3d],
+                                  dtype=np.bool_)
+        input_dict['gt_bboxes_3d'] = input_dict['gt_bboxes_3d'][gt_bboxes_mask]
+        input_dict['gt_labels_3d'] = input_dict['gt_labels_3d'][gt_bboxes_mask]
+
+        if 'gt_inds' in input_dict:
+            input_dict['gt_inds'] = input_dict['gt_inds'][gt_bboxes_mask]
+
+        return input_dict
+
+
+@PIPELINES.register_module()
+class CustomCollect3D(object):
+    """Collect data from the loader relevant to the specific task.
+    This is usually the last stage of the data loader pipeline. Typically keys
+    is set to some subset of "img", "proposals", "gt_bboxes",
+    "gt_bboxes_ignore", "gt_labels", and/or "gt_masks".
+    The "img_meta" item is always populated.  The contents of the "img_meta"
+    dictionary depends on "meta_keys". By default this includes:
+        - 'img_shape': shape of the image input to the network as a tuple \
+            (h, w, c).  Note that images may be zero padded on the \
+            bottom/right if the batch tensor is larger than this shape.
+        - 'scale_factor': a float indicating the preprocessing scale
+        - 'flip': a boolean indicating if image flip transform was used
+        - 'filename': path to the image file
+        - 'ori_shape': original shape of the image as a tuple (h, w, c)
+        - 'pad_shape': image shape after padding
+        - 'lidar2img': transform from lidar to image
+        - 'depth2img': transform from depth to image
+        - 'cam2img': transform from camera to image
+        - 'pcd_horizontal_flip': a boolean indicating if point cloud is \
+            flipped horizontally
+        - 'pcd_vertical_flip': a boolean indicating if point cloud is \
+            flipped vertically
+        - 'box_mode_3d': 3D box mode
+        - 'box_type_3d': 3D box type
+        - 'img_norm_cfg': a dict of normalization information:
+            - mean: per channel mean subtraction
+            - std: per channel std divisor
+            - to_rgb: bool indicating if bgr was converted to rgb
+        - 'pcd_trans': point cloud transformations
+        - 'sample_idx': sample index
+        - 'pcd_scale_factor': point cloud scale factor
+        - 'pcd_rotation': rotation applied to point cloud
+        - 'pts_filename': path to point cloud file.
+    Args:
+        keys (Sequence[str]): Keys of results to be collected in ``data``.
+        meta_keys (Sequence[str], optional): Meta keys to be converted to
+            ``mmcv.DataContainer`` and collected in ``data[img_metas]``.
+            Default: ('filename', 'ori_shape', 'img_shape', 'lidar2img',
+            'depth2img', 'cam2img', 'pad_shape', 'scale_factor', 'flip',
+            'pcd_horizontal_flip', 'pcd_vertical_flip', 'box_mode_3d',
+            'box_type_3d', 'img_norm_cfg', 'pcd_trans',
+            'sample_idx', 'pcd_scale_factor', 'pcd_rotation', 'pts_filename')
+    """
+
+    def __init__(self,
+                 keys,
+                 meta_keys=('filename', 'ori_shape', 'img_shape', 'lidar2img',
+                            'depth2img', 'cam2img', 'pad_shape',
+                            'scale_factor', 'flip', 'pcd_horizontal_flip',
+                            'pcd_vertical_flip', 'box_mode_3d', 'box_type_3d',
+                            'img_norm_cfg', 'pcd_trans', 'sample_idx', 'prev_idx', 'next_idx',
+                            'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
+                            'transformation_3d_flow', 'scene_token',
+                            'can_bus', 'index'
+                            )):
+        self.keys = keys
+        self.meta_keys = meta_keys
+
+    def __call__(self, results):
+        """Call function to collect keys in results. The keys in ``meta_keys``
+        will be converted to :obj:`mmcv.DataContainer`.
+        Args:
+            results (dict): Result dict contains the data to collect.
+        Returns:
+            dict: The result dict contains the following keys
+                - keys in ``self.keys``
+                - ``img_metas``
+        """
+
+        data = {}
+        img_metas = {}
+        for key in self.meta_keys:
+            if key in results:
+                img_metas[key] = results[key]
+        data['img_metas'] = DC(img_metas, cpu_only=True)
+
+        for key in self.keys:
+            data[key] = results[key]
+        return data
+
+    def __repr__(self):
+        """str: Return a string that describes the module."""
+        return self.__class__.__name__ + \
+            f'(keys={self.keys}, meta_keys={self.meta_keys})'
+
+
+@PIPELINES.register_module()
+class RandomScaleImageMultiViewImage(object):
+    """Random scale the image
+    Args:
+        scales
+    """
+
+    def __init__(self, scales=[]):
+        self.scales = scales
+        assert len(self.scales) == 1
+
+    def __call__(self, results):
+        """Call function to pad images, masks, semantic segmentation maps.
+        Args:
+            results (dict): Result dict from loading pipeline.
+        Returns:
+            dict: Updated result dict.
+        """
+        rand_ind = np.random.permutation(range(len(self.scales)))[0]
+        rand_scale = self.scales[rand_ind]
+
+        y_size = [int(img.shape[0] * rand_scale) for img in results['img']]
+        x_size = [int(img.shape[1] * rand_scale) for img in results['img']]
+        scale_factor = np.eye(4)
+        scale_factor[0, 0] *= rand_scale
+        scale_factor[1, 1] *= rand_scale
+        results['img'] = [mmcv.imresize(img, (x_size[idx], y_size[idx]), return_scale=False) for idx, img in
+                          enumerate(results['img'])]
+        lidar2img = [scale_factor @ l2i for l2i in results['lidar2img']]
+        results['lidar2img'] = lidar2img
+        results['img_shape'] = [img.shape for img in results['img']]
+        results['ori_shape'] = [img.shape for img in results['img']]
+
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(size={self.scales}, '
+        return repr_str
+
+
+@PIPELINES.register_module()
+class ObjectRangeFilterTrack(object):
+    """Filter objects by the range.
+    Args:
+        point_cloud_range (list[float]): Point cloud range.
+    """
+
+    def __init__(self, point_cloud_range):
+        self.pcd_range = np.array(point_cloud_range, dtype=np.float32)
+
+    def __call__(self, input_dict):
+        """Call function to filter objects by the range.
+        Args:
+            input_dict (dict): Result dict from loading pipeline.
+        Returns:
+            dict: Results after filtering, 'gt_bboxes_3d', 'gt_labels_3d' \
+                keys are updated in the result dict.
+        """
+        # Check points instance type and initialise bev_range
+        if isinstance(input_dict['gt_bboxes_3d'],
+                      (LiDARInstance3DBoxes, DepthInstance3DBoxes)):
+            bev_range = self.pcd_range[[0, 1, 3, 4]]
+        elif isinstance(input_dict['gt_bboxes_3d'], CameraInstance3DBoxes):
+            bev_range = self.pcd_range[[0, 2, 3, 5]]
+
+        if 'gt_inds' in input_dict['ann_info'].keys():
+            input_dict['gt_inds'] = input_dict['ann_info']['gt_inds']
+        if 'gt_fut_traj' in input_dict['ann_info'].keys():
+            input_dict['gt_fut_traj'] = input_dict['ann_info']['gt_fut_traj']
+        if 'gt_fut_traj_mask' in input_dict['ann_info'].keys():
+            input_dict['gt_fut_traj_mask'] = input_dict['ann_info']['gt_fut_traj_mask']
+        if 'gt_past_traj' in input_dict['ann_info'].keys():
+            input_dict['gt_past_traj'] = input_dict['ann_info']['gt_past_traj']
+        if 'gt_past_traj_mask' in input_dict['ann_info'].keys():
+            input_dict['gt_past_traj_mask'] = input_dict['ann_info']['gt_past_traj_mask']
+        if 'gt_sdc_bbox' in input_dict['ann_info'].keys():
+            input_dict['gt_sdc_bbox'] = input_dict['ann_info']['gt_sdc_bbox']
+            input_dict['gt_sdc_label'] = input_dict['ann_info']['gt_sdc_label']
+            input_dict['gt_sdc_fut_traj'] = input_dict['ann_info']['gt_sdc_fut_traj']
+            input_dict['gt_sdc_fut_traj_mask'] = input_dict['ann_info']['gt_sdc_fut_traj_mask']
+
+        gt_bboxes_3d = input_dict['gt_bboxes_3d']
+        gt_labels_3d = input_dict['gt_labels_3d']
+        gt_inds = input_dict['gt_inds']
+
+        mask = gt_bboxes_3d.in_range_bev(bev_range)
+        gt_bboxes_3d = gt_bboxes_3d[mask]
+        # mask is a torch tensor but gt_labels_3d is still numpy array
+        # using mask to index gt_labels_3d will cause bug when
+        # len(gt_labels_3d) == 1, where mask=1 will be interpreted
+        # as gt_labels_3d[1] and cause out of index error
+        mask = mask.numpy().astype(np.bool)
+        gt_labels_3d = gt_labels_3d[mask]
+        gt_inds = gt_inds[mask]
+
+        # limit rad to [-pi, pi]
+        gt_bboxes_3d.limit_yaw(offset=0.5, period=2 * np.pi)
+        input_dict['gt_bboxes_3d'] = gt_bboxes_3d
+        input_dict['gt_labels_3d'] = gt_labels_3d
+        input_dict['gt_inds'] = gt_inds
+        # input_dict['gt_fut_traj'] = gt_fut_traj
+        # input_dict['gt_fut_traj_mask'] = gt_fut_traj_mask
+        # input_dict['gt_past_traj'] = gt_past_traj
+        # input_dict['gt_past_traj_mask'] = gt_past_traj_mask
+
+        if 'gt_forecasting_locs' in input_dict.keys():
+            input_dict['gt_forecasting_locs'] = input_dict['gt_forecasting_locs'][mask]
+            input_dict['gt_forecasting_masks'] = input_dict['gt_forecasting_masks'][mask]
+            input_dict['gt_forecasting_types'] = input_dict['gt_forecasting_types'][mask]
+        return input_dict
+
+    def __repr__(self):
+        """str: Return a string that describes the module."""
+        repr_str = self.__class__.__name__
+        repr_str += f'(point_cloud_range={self.pcd_range.tolist()})'
+        return repr_str
+
+
+@PIPELINES.register_module()
+class ObjectNameFilterTrack(object):
+    """Filter GT objects by their names.
+    Args:
+        classes (list[str]): List of class names to be kept for training.
+    """
+
+    def __init__(self, classes):
+        self.classes = classes
+        self.labels = list(range(len(self.classes)))
+
+    def __call__(self, input_dict):
+        """Call function to filter objects by their names.
+        Args:
+            input_dict (dict): Result dict from loading pipeline.
+        Returns:
+            dict: Results after filtering, 'gt_bboxes_3d', 'gt_labels_3d' \
+                keys are updated in the result dict.
+        """
+        gt_labels_3d = input_dict['gt_labels_3d']
+        gt_bboxes_mask = np.array([n in self.labels for n in gt_labels_3d],
+                                  dtype=np.bool_)
+        input_dict['gt_bboxes_3d'] = input_dict['gt_bboxes_3d'][gt_bboxes_mask]
+        input_dict['gt_labels_3d'] = input_dict['gt_labels_3d'][gt_bboxes_mask]
+        input_dict['gt_inds'] = input_dict['gt_inds'][gt_bboxes_mask]
+        # input_dict['gt_fut_traj'] = input_dict['gt_fut_traj'][gt_bboxes_mask]
+        # input_dict['gt_fut_traj_mask'] = input_dict['gt_fut_traj_mask'][gt_bboxes_mask]
+        # input_dict['gt_past_traj'] = input_dict['gt_past_traj'][gt_bboxes_mask]
+        # input_dict['gt_past_traj_mask'] = input_dict['gt_past_traj_mask'][gt_bboxes_mask]
+        if 'gt_forecasting_locs' in input_dict.keys():
+            input_dict['gt_forecasting_locs'] = input_dict['gt_forecasting_locs'][gt_bboxes_mask]
+            input_dict['gt_forecasting_masks'] = input_dict['gt_forecasting_masks'][gt_bboxes_mask]
+            input_dict['gt_forecasting_types'] = input_dict['gt_forecasting_types'][gt_bboxes_mask]
+        return input_dict
+
+    def __repr__(self):
+        """str: Return a string that describes the module."""
+        repr_str = self.__class__.__name__
+        repr_str += f'(classes={self.classes})'
+        return repr_str
+
+
+@PIPELINES.register_module()
+class CustomObjectRangeFilter(ObjectRangeFilter):
+    def __call__(self, results):
+        """Call function to filter objects by the range.
+        Args:
+            results (dict): Result dict from loading pipeline.
+        Returns:
+            dict: Results after filtering, 'gt_bboxes_3d', 'gt_labels_3d'
+                keys are updated in the result dict.
+        """
+        # Check points instance type and initialise bev_range
+        if isinstance(results['gt_bboxes_3d'],
+                      (LiDARInstance3DBoxes, DepthInstance3DBoxes)):
+            bev_range = self.pcd_range[[0, 1, 3, 4]]
+        elif isinstance(results['gt_bboxes_3d'], CameraInstance3DBoxes):
+            bev_range = self.pcd_range[[0, 2, 3, 5]]
+
+        gt_bboxes_3d = results['gt_bboxes_3d']
+        gt_labels_3d = results['gt_labels_3d']
+        mask = gt_bboxes_3d.in_range_bev(bev_range)
+        gt_bboxes_3d = gt_bboxes_3d[mask]
+        # mask is a torch tensor but gt_labels_3d is still numpy array
+        # using mask to index gt_labels_3d will cause bug when
+        # len(gt_labels_3d) == 1, where mask=1 will be interpreted
+        # as gt_labels_3d[1] and cause out of index error
+        gt_labels_3d = gt_labels_3d[mask.numpy().astype(np.bool)]
+
+        # limit rad to [-pi, pi]
+        gt_bboxes_3d.limit_yaw(offset=0.5, period=2 * np.pi)
+        results['gt_bboxes_3d'] = gt_bboxes_3d
+        results['gt_labels_3d'] = gt_labels_3d
+        # results['ann_tokens'] = results['ann_tokens'][mask.numpy().astype(np.bool)]
+
+        return results
+
+
+@PIPELINES.register_module()
+class CustomObjectNameFilter(ObjectNameFilter):
+    def __call__(self, results):
+        """Call function to filter objects by their names.
+        Args:
+            results (dict): Result dict from loading pipeline.
+        Returns:
+            dict: Results after filtering, 'gt_bboxes_3d', 'gt_labels_3d'
+                keys are updated in the result dict.
+        """
+        gt_labels_3d = results['gt_labels_3d']
+        gt_bboxes_mask = np.array([n in self.labels for n in gt_labels_3d],
+                                  dtype=np.bool_)
+        results['gt_bboxes_3d'] = results['gt_bboxes_3d'][gt_bboxes_mask]
+        results['gt_labels_3d'] = results['gt_labels_3d'][gt_bboxes_mask]
+        # results['ann_tokens'] = results['ann_tokens'][gt_bboxes_mask]
+
+        return results

@@ -1,5 +1,18 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from __future__ import division
+import mmcv
+from mmseg import __version__ as mmseg_version
+from mmdet.apis import set_random_seed
+from mmdet3d.utils import collect_env, get_root_logger
+from mmdet3d.models import build_model
+from mmdet3d.datasets import build_dataset
+from mmdet3d.apis import init_random_seed, train_model
+from mmdet3d import __version__ as mmdet3d_version
+from mmdet import __version__ as mmdet_version
+from mmcv.runner import get_dist_info, init_dist
+from mmcv import Config, DictAction
+import torch.distributed as dist
+import torch
 import argparse
 import copy
 import os
@@ -7,16 +20,11 @@ import time
 import warnings
 from os import path as osp
 
-# Fix CmtDetector registration
-import sys
-sys.path.insert(0, '/home/thx/data-mnt/code/CMT')
-from mmdet3d.models.builder import DETECTORS
-from projects.mmdet3d_plugin.models.detectors.cmt import CmtDetector
-
-# 手动注册 CmtDetector
-DETECTORS.register_module()(CmtDetector)
+warnings.filterwarnings('ignore', message='.*Non-finite norm encountered in torch.nn.utils.clip_grad_norm_.*')
 
 # Suppress noisy stderr (e.g. spconv GPU arch) and common warnings; install early.
+
+
 def _install_suppress():
     try:
         from tools.suppress_warnings import install_suppress
@@ -24,20 +32,6 @@ def _install_suppress():
         from suppress_warnings import install_suppress
     install_suppress()
 
-import mmcv
-import torch
-import torch.distributed as dist
-from mmcv import Config, DictAction
-from mmcv.runner import get_dist_info, init_dist
-
-from mmdet import __version__ as mmdet_version
-from mmdet3d import __version__ as mmdet3d_version
-from mmdet3d.apis import init_random_seed, train_model
-from mmdet3d.datasets import build_dataset
-from mmdet3d.models import build_model
-from mmdet3d.utils import collect_env, get_root_logger
-from mmdet.apis import set_random_seed
-from mmseg import __version__ as mmseg_version
 
 try:
     # If mmdet version > 2.20.0, setup_multi_processes would be imported and
@@ -168,7 +162,7 @@ def main():
                     _module_path = _module_path + '.' + m
                 print(_module_path)
                 plg_lib = importlib.import_module(_module_path)
-                
+
     plg_lib = importlib.import_module('mmdet3d')
 
     # set cudnn_benchmark

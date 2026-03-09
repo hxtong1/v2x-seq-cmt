@@ -1077,6 +1077,11 @@ def _get_instance_token_mappings(total_annotations, sample_info_mappings):
 
 # ----------SPD datasets Process-------------------
 
+# vis_gt 约定：timestamp 统一为微秒（/1e6 得秒）。原始可能是秒或微秒，此处规范化
+def _timestamp_to_us(ts):
+    ts = float(ts)
+    return int(ts * 1e6) if ts < 1e12 else int(ts)
+
 
 def _generate_sample_infos(data_infos):
     """Get the prev and next sample token for a given `sample_data_token`.
@@ -1098,8 +1103,8 @@ def _generate_sample_infos(data_infos):
         for idx, fid in enumerate(frame_ids):
             info = {
                 'token': fid,
-                'timestamp': float(sample_mappings[fid]['pointcloud_timestamp']),  # vis_gt：保持原始
-                'image_timestamp': float(sample_mappings[fid]['image_timestamp']),
+                'timestamp': _timestamp_to_us(sample_mappings[fid]['pointcloud_timestamp']),
+                'image_timestamp': _timestamp_to_us(sample_mappings[fid]['image_timestamp']),
                 'scene_token': scene_token,
                 'location': sample_mappings[fid]['intersection_loc'],
                 'frame_idx': idx,
@@ -1146,16 +1151,16 @@ def _generate_sample_infos_coop(coop_data_infos, veh_data_infos, inf_data_infos)
 
             info = {
                 'token': veh_fid,
-                'timestamp': float(veh_info['pointcloud_timestamp']),  # vis_gt 一致
-                'image_timestamp': float(veh_info['image_timestamp']),
+                'timestamp': _timestamp_to_us(veh_info['pointcloud_timestamp']),
+                'image_timestamp': _timestamp_to_us(veh_info['image_timestamp']),
                 'scene_token': veh_info['sequence_id'],
                 'location': veh_info['intersection_loc'],
                 'frame_idx': idx,
                 'prev': frame_ids[idx-1] if idx > 0 else '',
                 'next': frame_ids[idx+1] if idx < len(frame_ids)-1 else '',
                 'token_inf': inf_fid,
-                'timestamp_inf': float(inf_info['pointcloud_timestamp']),
-                'image_timestamp_inf': float(inf_info['image_timestamp']),
+                'timestamp_inf': _timestamp_to_us(inf_info['pointcloud_timestamp']),
+                'image_timestamp_inf': _timestamp_to_us(inf_info['image_timestamp']),
                 'system_error_offset': coop_info['system_error_offset']
             }
             sample_infos.append(info)

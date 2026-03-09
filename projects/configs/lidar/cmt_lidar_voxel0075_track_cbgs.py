@@ -1,3 +1,4 @@
+_base_ = ["../_base_/default_runtime.py", "../_base_/datasets/nus-3d.py"]
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
@@ -7,16 +8,28 @@ class_names = [
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
 evaluation = dict(interval=20)
-dataset_type = 'CustomNuScenesDataset'
+dataset_type = 'SPDDataset'
+# data_root: for train/load use raw vehicle-side; for eval (det/track), NuScenes format required.
+# If mAP=0, run spd_to_nuscenes and set data_root to its output (or use CustomNuScenesDataset + pkl GT).
 data_root = '/home/thx/data-mnt/code/CMT/datasets/V2X-Seq-SPD-New/vehicle-side'
-# info_path = '/home/thx/data-mnt/code/CMT/data/infos/V2X-Seq-SPD-New/vehicle-side'
-info_path = '/home/thx/data-mnt/code/CMT/vis_gt'
+info_path = '/home/thx/data-mnt/code/CMT/data/infos/V2X-Seq-SPD-New/vehicle-side'
+# info_path = '/home/thx/data-mnt/code/CMT/vis_gt'
+
+# For SPD eval: distance (m) per class for filtering. Must match CLASSES.
+class_range = {
+    "car": 50,
+    "pedestrian": 50,
+    "bicycle": 50,
+}
+# Split file for eval: batch_split['train']/['val'] scene names. Create via spd_to_uniad or manual.
+split_datas_file = "data/split_datas/cooperative-split-data-spd.json"
+
 input_modality = dict(
     use_lidar=True,
     use_camera=False,
     use_radar=False,
     use_map=False,
-    use_external=False)
+    use_external=True)
 
 file_client_args = dict(backend="disk")
 
@@ -36,67 +49,42 @@ train_pipeline = [
         file_client_args=file_client_args,
         pts_root=data_root,
     ),
-    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
-    # dict(
-    # type='ObjectSample',
-    # db_sampler=dict(
-    #     data_root=None,
-    #     info_path=info_path + '/spd_infos_temporal_train.pkl',
-    #     rate=1.0,
-    #     prepare=dict(
-    #         filter_by_min_points=dict(
-    #             car=5,
-    #             truck=5,
-    #             bus=5,
-    #             trailer=5,
-    #             construction_vehicle=5,
-    #             traffic_cone=5,
-    #             barrier=5,
-    #             motorcycle=5,
-    #             bicycle=5,
-    #             pedestrian=5)),
-    #     classes=class_names,
-    #     sample_groups=dict(
-    #         car=2,
-    #         truck=3,
-    #         construction_vehicle=7,
-    #         bus=4,
-    #         trailer=6,
-    #         barrier=2,
-    #         motorcycle=6,
-    #         bicycle=6,
-    #         pedestrian=2,
-    #         traffic_cone=2),
-    #     points_loader=dict(
-    #         type='LoadPointsFromFile_E2E',
-    #         coord_type='LIDAR',
-    #         load_dim=5,
-    #         use_dim=[0, 1, 2, 3, 4],
-    #     ))),
+    dict(type='LoadAnnotations3D_E2E',
+         with_bbox_3d=True,
+         with_label_3d=True,
+         with_attr_label=False,
+
+         with_future_anns=False,  # occ_flow gt
+         with_ins_inds_3d=True,  # ins_inds
+         ins_inds_add_1=True,  # ins_inds start from 1
+         with_forecasting=False,
+
+         ),
+
     dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.3925 * 2, 0.3925 * 2],
         scale_ratio_range=[0.9, 1.1],
         translation_std=[0.5, 0.5, 0.5]),
-    dict(
-        type='RandomFlip3D',
-        sync_2d=False,
-        flip_ratio_bev_horizontal=0.5,
-        flip_ratio_bev_vertical=0.5),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
-    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
-    dict(type='ObjectNameFilter', classes=class_names),
-    dict(type='PointShuffle'),
+    dict(type="ObjectRangeFilterTrack", point_cloud_range=point_cloud_range),
+    dict(type="ObjectNameFilterTrack", classes=class_names),
+
     dict(type='DefaultFormatBundle3D', class_names=class_names),
-    dict(type='Collect3D', keys=['points', 'gt_bboxes_3d', 'gt_labels_3d'],
-         meta_keys=('filename', 'ori_shape', 'img_shape', 'lidar2img',
-                    'depth2img', 'cam2img', 'pad_shape',
-                    'scale_factor', 'flip', 'pcd_horizontal_flip',
-                    'pcd_vertical_flip', 'box_mode_3d', 'box_type_3d',
-                    'img_norm_cfg', 'pcd_trans', 'sample_idx',
-                    'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
-                    'transformation_3d_flow', 'rot_degree',
-                    'gt_bboxes_3d', 'gt_labels_3d'))
+    dict(
+        type="CustomCollect3D",
+        keys=[
+            "gt_bboxes_3d",
+            "gt_labels_3d",
+            "gt_inds",
+
+            "points",
+            "timestamp",
+            "l2g_r_mat",
+            "l2g_t",
+
+        ],
+    ),
 ]
 test_pipeline = [
     dict(
@@ -130,56 +118,95 @@ test_pipeline = [
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
                 with_label=False),
-            dict(type='Collect3D', keys=['points'])
+            dict(
+                type="CustomCollect3D", keys=[
+                    "gt_bboxes_3d",
+                    "gt_labels_3d",
+                    "gt_inds",
+
+                    "points",
+                    "timestamp",
+                    "l2g_r_mat",
+                    "l2g_t",
+                ]
+            ),
+
         ])
 ]
 data = dict(
     samples_per_gpu=2,
     workers_per_gpu=6,
-    # 直接使用 dataset，不用 CBGSDataset：训练集中若某类样本数为 0 会导致 CBGSDataset 内除零
     train=dict(
-        # type='CBGSDataset',
-        # dataset=dict(
-        #     type=dataset_type,
-        #     data_root=data_root,
-        #     ann_file=info_path + '/spd_infos_temporal_train.pkl',
-        #     load_interval=1,
-        #     pipeline=train_pipeline,
-        #     classes=class_names,
-        #     modality=input_modality,
-        #     test_mode=False,
-        #     box_type_3d='LiDAR')),
         type=dataset_type,
         data_root=data_root,
         ann_file=info_path + '/spd_infos_temporal_train.pkl',
         load_interval=1,
+        queue_length=2,
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
         test_mode=False,
+        filter_empty_gt=False,
         box_type_3d='LiDAR'),
     val=dict(
         type=dataset_type,
         data_root=data_root,
         ann_file=info_path + '/spd_infos_temporal_val.pkl',
         load_interval=1,
+        queue_length=2,
         pipeline=test_pipeline,
         classes=class_names,
         modality=input_modality,
         test_mode=True,
-        box_type_3d='LiDAR'),
+        box_type_3d='LiDAR',
+        eval_mod=['det', 'track'],
+        split_datas_file=split_datas_file,
+        class_range=class_range),
     test=dict(
         type=dataset_type,
         data_root=data_root,
         ann_file=info_path + '/spd_infos_temporal_val.pkl',
         load_interval=1,
+        queue_length=2,
         pipeline=test_pipeline,
         classes=class_names,
         modality=input_modality,
         test_mode=True,
-        box_type_3d='LiDAR'))
+        box_type_3d='LiDAR',
+        eval_mod=['det', 'track'],
+        split_datas_file=split_datas_file,
+        class_range=class_range))
 model = dict(
-    type='CmtDetector',
+    type='CMTCoopTracker',
+    pc_range=point_cloud_range,
+    train_track=True,
+    seq_mode=True,
+    batch_size=2,
+    video_test_mode=True,
+    spatial_temporal_reason=dict(
+        history_reasoning=False,
+        future_reasoning=False,
+        embed_dims=256,
+        hist_len=3,
+        fut_len=4,
+        num_reg_fcs=2,
+        code_size=10,
+        num_classes=3,
+        pc_range=point_cloud_range,
+        is_motion=False,
+        is_cooperation=False,
+        learn_match=False,
+        veh_thre=0.05,
+    ),
+    runtime_tracker=dict(
+        score_threshold=0.4,
+        record_threshold=0.4,
+        output_threshold=0.2,
+        max_age_since_update=1,
+        iou_threshold=0.1,
+        min_active=1,
+        num_track_instance=300,
+    ),
     pts_voxel_layer=dict(
         num_point_features=5,
         max_num_points=10,
@@ -227,12 +254,14 @@ model = dict(
             dict(num_class=3, class_names=['car', 'bicycle', 'pedestrian'])
         ],
         bbox_coder=dict(
-            type='MultiTaskBBoxCoder',
+            type='MultiTaskBBoxTrackCoder',
             post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
             pc_range=point_cloud_range,
-            max_num=300,
+            max_num=200,
             voxel_size=voxel_size,
-            num_classes=3),
+            num_classes=3,
+            score_threshold=0.1,
+            with_nms=False),
         separate_head=dict(
             type='SeparateTaskHead', init_bias=-2.19, final_kernel=3),
         transformer=dict(
@@ -269,24 +298,24 @@ model = dict(
                                      'ffn', 'norm')),
             )),
         loss_cls=dict(
-            type='FocalLoss', 
-            use_sigmoid=True, 
+            type='FocalLoss',
+            use_sigmoid=True,
             gamma=2,
-            alpha=0.25, 
-            reduction='mean', 
+            alpha=0.25,
+            reduction='mean',
             loss_weight=2.0),
         loss_bbox=dict(
-            type='L1Loss', 
-            reduction='mean', 
+            type='L1Loss',
+            reduction='mean',
             loss_weight=0.5),
         loss_heatmap=dict(
             type='GaussianFocalLoss',
-            reduction='mean', 
+            reduction='mean',
             loss_weight=1.0),
     ),
     train_cfg=dict(
         pts=dict(
-            dataset='nuScenes',
+            dataset='spd',
             assigner=dict(
                 type='HungarianAssigner3D',
                 cls_cost=dict(type='FocalLossCost', weight=2.0),
@@ -307,7 +336,7 @@ model = dict(
             point_cloud_range=point_cloud_range)),
     test_cfg=dict(
         pts=dict(
-            dataset='nuScenes',
+            dataset='spd',
             grid_size=[1440, 1440, 40],
             out_size_factor=out_size_factor,
             pc_range=point_cloud_range[0:2],
@@ -358,9 +387,8 @@ log_config = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
-# load_from = None
 resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)
-load_from = None
+load_from = '/home/thx/data-mnt/code/CMT/ckps/cmt_lidar_det_epoch48.pth'
 # load_from = '/home/thx/data-mnt/code/CMT/ckps/lidar_voxel0075_epoch20.pth'

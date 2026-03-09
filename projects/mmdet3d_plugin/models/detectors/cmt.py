@@ -20,7 +20,7 @@ from mmdet3d.core import (Box3DMode, Coord3DMode, bbox3d2result,
                           merge_aug_bboxes_3d, show_result)
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 
-from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
+from projects.mmdet3d_plugin.models.modules.grid_mask import GridMask
 from projects.mmdet3d_plugin import SPConvVoxelization
 
 
@@ -33,9 +33,10 @@ class CmtDetector(MVXTwoStageDetector):
         pts_voxel_cfg = kwargs.get('pts_voxel_layer', None)
         kwargs['pts_voxel_layer'] = None
         super(CmtDetector, self).__init__(**kwargs)
-        
+
         self.use_grid_mask = use_grid_mask
-        self.grid_mask = GridMask(True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
+        self.grid_mask = GridMask(
+            True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         if pts_voxel_cfg:
             self.pts_voxel_layer = SPConvVoxelization(**pts_voxel_cfg)
 
@@ -43,7 +44,7 @@ class CmtDetector(MVXTwoStageDetector):
         """Initialize model weights."""
         super(CmtDetector, self).init_weights()
 
-    @auto_fp16(apply_to=('img'), out_fp32=True) 
+    @auto_fp16(apply_to=('img'), out_fp32=True)
     def extract_img_feat(self, img, img_metas):
         """Extract features of images."""
         if self.with_img_backbone and img is not None:
@@ -217,7 +218,7 @@ class CmtDetector(MVXTwoStageDetector):
                     name, type(var)))
 
         return self.simple_test(points[0], img_metas[0], img[0], **kwargs)
-    
+
     @force_fp32(apply_to=('x', 'x_img'))
     def simple_test_pts(self, x, x_img, img_metas, rescale=False):
         """Test function of point cloud branch."""
@@ -227,7 +228,7 @@ class CmtDetector(MVXTwoStageDetector):
         bbox_results = [
             bbox3d2result(bboxes, scores, labels)
             for bboxes, scores, labels in bbox_list
-        ] 
+        ]
         return bbox_results
 
     def simple_test(self, points, img_metas, img=None, rescale=False):
@@ -237,7 +238,7 @@ class CmtDetector(MVXTwoStageDetector):
             pts_feats = [None]
         if img_feats is None:
             img_feats = [None]
-        
+
         bbox_list = [dict() for i in range(len(img_metas))]
         if (pts_feats or img_feats) and self.with_pts_bbox:
             bbox_pts = self.simple_test_pts(

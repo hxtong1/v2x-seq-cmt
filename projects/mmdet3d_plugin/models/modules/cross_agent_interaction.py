@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from projects.mmdet3d_plugin.core.bbox.structures import Instances
+from projects.mmdet3d_plugin.core.bbox.track_instance import Instances
 
 import pdb
 import matplotlib.pyplot as plt
