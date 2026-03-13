@@ -427,9 +427,6 @@ test_pipeline = [
                                             #coop
                                             "veh2inf_rt",
                                             *inf_keys,
-                                            "gt_bboxes_3d",
-                                            "gt_labels_3d",
-                                            "gt_inds",
                                             "img",
                                             "timestamp",
                                             "l2g_r_mat",

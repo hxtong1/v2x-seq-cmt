@@ -15,7 +15,7 @@ if [ ! -d ${WORK_DIR}logs ]; then
 fi
 
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
-python $(dirname "$0")/test.py \
+/home/thx/.conda/envs/cmt/bin/python $(dirname "$0")/test.py \
     $CFG \
     $CKPT \
     --eval bbox \

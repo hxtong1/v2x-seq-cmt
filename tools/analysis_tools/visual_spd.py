@@ -1,3 +1,6 @@
+from scipy.linalg import polar
+from nuscenes.utils.data_classes import PointCloud
+from nuscenes.eval.common.utils import boxes_to_sensor
 import mmcv
 import argparse
 import os
@@ -26,38 +29,212 @@ from nuscenes.eval.common.data_classes import EvalBoxes, EvalBox
 # from nuscenes.eval.detection.data_classes import DetectionBox
 from nuscenes.eval.tracking.data_classes import TrackingBox, TrackingConfig
 from nuscenes.eval.detection.utils import category_to_detection_name
-from transform_box_veh2inf import veh2inf_convert, read_json
+import json
+import struct
+import os.path as osp
+
+
+def _lzf_decompress(data, expected_length):
+    """Minimal LZF decompressor for PCD binary_compressed blocks. Ref: visualize_coop.py"""
+    i = 0
+    o = 0
+    out = bytearray(expected_length if expected_length is not None else 0)
+    data_len = len(data)
+    while i < data_len:
+        ctrl = data[i]
+        i += 1
+        if ctrl < 32:
+            length = ctrl + 1
+            if expected_length is not None and o + length > expected_length:
+                raise ValueError("LZF literal overrun.")
+            if expected_length is None:
+                out.extend(data[i:i + length])
+            else:
+                out[o:o + length] = data[i:i + length]
+            o += length
+            i += length
+        else:
+            length = ctrl >> 5
+            ref = o - ((ctrl & 0x1F) << 8) - 1
+            if length == 7:
+                length += data[i]
+                i += 1
+            ref -= data[i]
+            i += 1
+            length += 2
+            if ref < 0:
+                raise ValueError("Invalid LZF back-reference.")
+            if expected_length is not None and o + length > expected_length:
+                raise ValueError("LZF back-reference overrun.")
+            for _ in range(length):
+                if expected_length is None:
+                    out.append(out[ref])
+                else:
+                    out[o] = out[ref]
+                o += 1
+                ref += 1
+    if expected_length is not None and o != expected_length:
+        raise ValueError(
+            f"LZF decompressed size mismatch: got {o}, expected {expected_length}")
+    return bytes(out if expected_length is None else out[:o])
+
+
+def _load_points_xyz_from_pcd(pcd_path):
+    """Load xyz from PCD (ascii / binary / binary_compressed). Ref: visualize_coop.py"""
+    with open(pcd_path, 'rb') as f:
+        header = {}
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError("Invalid PCD: missing DATA header.")
+            line_decoded = line.decode('ascii', errors='ignore').strip()
+            if not line_decoded or line_decoded.startswith('#'):
+                continue
+            parts = line_decoded.split()
+            key = parts[0].upper()
+            value = parts[1:]
+            header[key] = value
+            if key == 'DATA':
+                break
+        data_blob = f.read()
+
+    fields = header.get('FIELDS', [])
+    sizes = list(map(int, header.get('SIZE', [])))
+    types = header.get('TYPE', [])
+    counts = list(map(int, header.get('COUNT', ['1'] * len(fields))))
+    points = int(header.get('POINTS', [header.get('WIDTH', ['0'])[0]])[0])
+    data_type = header.get('DATA', ['binary'])[0].lower()
+    if not fields or not sizes or not types or len(fields) != len(sizes) or len(fields) != len(types):
+        raise ValueError("Invalid PCD header fields.")
+
+    bytes_per_field = [s * c for s, c in zip(sizes, counts)]
+    xyz_idx = [fields.index('x'), fields.index('y'), fields.index('z')]
+
+    def _dtype_of(size, typ):
+        if typ == 'F' and size == 4:
+            return np.float32
+        if typ == 'F' and size == 8:
+            return np.float64
+        if typ == 'U' and size == 1:
+            return np.uint8
+        if typ == 'U' and size == 2:
+            return np.uint16
+        if typ == 'U' and size == 4:
+            return np.uint32
+        if typ == 'I' and size == 1:
+            return np.int8
+        if typ == 'I' and size == 2:
+            return np.int16
+        if typ == 'I' and size == 4:
+            return np.int32
+        raise ValueError(f"Unsupported PCD type/size: {typ}{size}")
+
+    if data_type == 'ascii':
+        text = data_blob.decode('ascii', errors='ignore').strip()
+        if not text:
+            return np.zeros((0, 3), dtype=np.float32)
+        data = np.loadtxt(text.splitlines(), dtype=np.float64)
+        if data.ndim == 1:
+            data = data[None, :]
+        return data[:, xyz_idx].astype(np.float32)
+
+    if data_type == 'binary':
+        point_step = sum(bytes_per_field)
+        expected = points * point_step
+        raw = data_blob[:expected]
+        if len(raw) < expected:
+            raise ValueError("Truncated PCD binary payload.")
+        offsets = []
+        cur = 0
+        for flen in bytes_per_field:
+            offsets.append(cur)
+            cur += flen
+        dtype_desc = []
+        for name, size, typ, cnt, off in zip(fields, sizes, types, counts, offsets):
+            dt = _dtype_of(size, typ)
+            shape = (cnt,) if cnt > 1 else ()
+            dtype_desc.append((name, dt, shape, off))
+        structured_dtype = np.dtype(
+            {'names': [x[0] for x in dtype_desc],
+             'formats': [np.dtype((x[1], x[2])) for x in dtype_desc],
+             'offsets': [x[3] for x in dtype_desc],
+             'itemsize': point_step}
+        )
+        arr = np.frombuffer(raw, dtype=structured_dtype, count=points)
+        return np.stack(
+            [arr['x'].reshape(points, -1)[:, 0].astype(np.float32),
+             arr['y'].reshape(points, -1)[:, 0].astype(np.float32),
+             arr['z'].reshape(points, -1)[:, 0].astype(np.float32)],
+            axis=1
+        )
+
+    if data_type == 'binary_compressed':
+        if len(data_blob) < 8:
+            raise ValueError("Invalid compressed PCD payload.")
+        compressed_size = struct.unpack('<I', data_blob[:4])[0]
+        uncompressed_size = struct.unpack('<I', data_blob[4:8])[0]
+        compressed = data_blob[8:8 + compressed_size]
+        raw = _lzf_decompress(compressed, uncompressed_size)
+        xyz = {}
+        offset = 0
+        for i, (size, typ, cnt) in enumerate(zip(sizes, types, counts)):
+            dt = _dtype_of(size, typ)
+            field_bytes = points * size * cnt
+            block = raw[offset:offset + field_bytes]
+            if i in xyz_idx:
+                arr = np.frombuffer(block, dtype=dt, count=points * cnt)
+                arr = arr.reshape(points, cnt)[:, 0]
+                xyz[fields[i]] = arr.astype(np.float32)
+            offset += field_bytes
+        return np.stack([xyz['x'], xyz['y'], xyz['z']], axis=1)
+
+    raise ValueError(f"Unsupported PCD DATA type: {data_type}")
+
+
+def _load_points_xyz(lidar_path, load_dim=4):
+    """Load (N,3) xyz. Supports .bin and .pcd (ascii/binary/binary_compressed)."""
+    candidates = [lidar_path]
+    if lidar_path.endswith('.bin'):
+        candidates.append(lidar_path[:-4] + '.pcd')
+    elif lidar_path.endswith('.pcd.bin'):
+        candidates.append(lidar_path.replace('.pcd.bin', '.pcd'))
+    for p in candidates:
+        if not osp.isfile(p):
+            continue
+        if p.endswith('.bin') or p.endswith('.pcd.bin'):
+            pts = np.fromfile(p, dtype=np.float32).reshape(-1, load_dim)
+            return pts[:, :3]
+        if p.endswith('.pcd'):
+            return _load_points_xyz_from_pcd(p)
+    raise FileNotFoundError(f"Point cloud not found: {lidar_path}")
+
+
+def read_json(path_json):
+    """Load JSON file. Replaces missing transform_box_veh2inf.read_json."""
+    with open(path_json, 'r') as f:
+        return json.load(f)
 
 
 cams = ['CAM_FRONT',
- 'CAM_FRONT_RIGHT',
- 'CAM_BACK_RIGHT',
- 'CAM_BACK',
- 'CAM_BACK_LEFT',
- 'CAM_FRONT_LEFT']
+        'CAM_FRONT_RIGHT',
+        'CAM_BACK_RIGHT',
+        'CAM_BACK',
+        'CAM_BACK_LEFT',
+        'CAM_FRONT_LEFT']
 
 color_mapping = [
     np.array([1.0, 0.0, 0.0]),   # 鲜艳的红色
-    np.array([1.0, 0.078, 0.576]), # 鲜艳的粉色
+    np.array([1.0, 0.078, 0.576]),  # 鲜艳的粉色
     np.array([0.0, 0.0, 1.0]),   # 鲜艳的蓝色
     np.array([1.0, 1.0, 0.0]),   # 鲜艳的黄色
-    np.array([1.0, 0.647, 0.0]), # 鲜艳的橙色
-    np.array([0.502, 0.0, 0.502]), # 鲜艳的紫色
+    np.array([1.0, 0.647, 0.0]),  # 鲜艳的橙色
+    np.array([0.502, 0.0, 0.502]),  # 鲜艳的紫色
     np.array([0.0, 1.0, 1.0]),   # 鲜艳的青色
     np.array([1.0, 0.0, 1.0]),   # 鲜艳的洋红色
-    np.array([0.0, 1.0, 0.502]), # 鲜艳的青绿色
+    np.array([0.0, 1.0, 0.502]),  # 鲜艳的青绿色
     np.array([1.0, 0.843, 0.0])  # 鲜艳的金色
 ]
 
-import numpy as np
-import matplotlib.pyplot as plt
-from nuscenes.utils.data_classes import LidarPointCloud, RadarPointCloud, Box
-from PIL import Image
-from matplotlib import rcParams
-
-from nuscenes.eval.common.utils import boxes_to_sensor
-from nuscenes.utils.data_classes import PointCloud
-from scipy.linalg import polar
 
 class CustomLidarPointCloud(PointCloud):
 
@@ -77,11 +254,13 @@ class CustomLidarPointCloud(PointCloud):
         :return: LidarPointCloud instance (x, y, z, intensity).
         """
 
-        assert file_name.endswith('.bin'), 'Unsupported filetype {}'.format(file_name)
+        assert file_name.endswith(
+            '.bin'), 'Unsupported filetype {}'.format(file_name)
 
         scan = np.fromfile(file_name, dtype=np.float32)
         points = scan.reshape((-1, 4))[:, :cls.nbr_dims()]
         return cls(points.T)
+
 
 def iterative_closest_point(A, num_iterations=100):
     R = A.copy()
@@ -92,16 +271,73 @@ def iterative_closest_point(A, num_iterations=100):
 
     return R
 
+
+def veh2inf_convert(boxes, data_root, veh2inf, sample_data_token):
+    """Convert boxes from vehicle lidar frame to infrastructure lidar frame.
+    Replaces missing transform_box_veh2inf.veh2inf_convert.
+    Uses SPD calibration files same as tools/spd_evaluator/convert_result.py (inverse direction).
+    """
+    if len(boxes) == 0:
+        return boxes
+    veh_id = sample_data_token
+    if veh_id not in veh2inf:
+        return boxes
+    inf_id = veh2inf[veh_id]
+    err_offset = veh2inf.get(veh_id + 'offset', {'delta_x': 0, 'delta_y': 0})
+    err_offset = np.array([err_offset['delta_x'], err_offset['delta_y'], 0])
+
+    inf_virtuallidar2world_path = osp.join(
+        data_root, 'infrastructure-side/calib/virtuallidar_to_world', inf_id + '.json')
+    inf_virtuallidar2world = read_json(inf_virtuallidar2world_path)
+    inf_e2g_r = np.array(inf_virtuallidar2world['rotation'])
+    inf_e2g_t = np.array(inf_virtuallidar2world['translation']).reshape(3)
+
+    veh_ego2world_path = osp.join(
+        data_root, 'vehicle-side/calib/novatel_to_world', veh_id + '.json')
+    veh_ego2world = read_json(veh_ego2world_path)
+    veh_e2g_r = np.array(veh_ego2world['rotation'])
+    veh_e2g_t = np.array(veh_ego2world['translation']).reshape(3)
+
+    veh_lidar2ego_path = osp.join(
+        data_root, 'vehicle-side/calib/lidar_to_novatel', veh_id + '.json')
+    veh_lidar2ego = read_json(veh_lidar2ego_path)
+    veh_l2e_r = np.array(veh_lidar2ego['transform']['rotation'])
+    veh_l2e_t = np.array(veh_lidar2ego['transform']['translation']).reshape(3)
+
+    inf_l2e_r = np.eye(3)
+    inf_l2e_t = np.zeros(3)
+
+    r = ((veh_l2e_r.T @ veh_e2g_r.T) @ (np.linalg.inv(inf_e2g_r).T @ np.linalg.inv(inf_l2e_r).T)).T
+    t = (-err_offset @ veh_l2e_r.T @ veh_e2g_r.T + veh_l2e_t @ veh_e2g_r.T + veh_e2g_t) @ (
+        np.linalg.inv(inf_e2g_r).T @ np.linalg.inv(inf_l2e_r).T)
+    t -= inf_e2g_t @ (np.linalg.inv(inf_e2g_r).T @ np.linalg.inv(inf_l2e_r).T) + inf_l2e_t @ (
+        np.linalg.inv(inf_e2g_r).T @ np.linalg.inv(inf_l2e_r).T)
+    vehlidar2inflidar_rotation = iterative_closest_point(r)
+    vehlidar2inflidar_translation = t
+
+    out_boxes = []
+    for box in boxes:
+        b = copy.deepcopy(box)
+        b.rotate(Quaternion(matrix=vehlidar2inflidar_rotation))
+        b.translate(vehlidar2inflidar_translation)
+        out_boxes.append(b)
+    return out_boxes
+
+
 def visualize_sample(nusc: NuScenes,
                      sample_token: str,
                      gt_boxes: EvalBoxes,
                      pred_boxes: EvalBoxes,
                      nsweeps: int = 1,
                      conf_th: float = 0.15,
-                     eval_range: list = [-53.0, -53.0, 53.0, 53.0],
+                     eval_range: list = None,
                      verbose: bool = True,
                      savepath: str = None,
-                     ax=None) -> None:
+                     ax=None,
+                     show_point_cloud: bool = True,
+                     show_range_rings: bool = True,
+                     pc_range_regions: list = None,
+                     points: np.ndarray = None) -> None:
     """
     Visualizes a sample from BEV with annotations and detection results.
     :param nusc: NuScenes object.
@@ -110,14 +346,19 @@ def visualize_sample(nusc: NuScenes,
     :param pred_boxes: Prediction grouped by sample.
     :param nsweeps: Number of sweeps used for lidar visualization.
     :param conf_th: The confidence threshold used to filter negatives.
-    :param eval_range: Range in meters beyond which boxes are ignored.
-    :param verbose: Whether to print to stdout.
-    :param savepath: If given, saves the the rendering here instead of displaying.
+    :param eval_range: [xmin, ymin, xmax, ymax] in meters. Default [-53,-53,53,53].
+    :param show_point_cloud: Whether to overlay point cloud.
+    :param show_range_rings: Whether to draw concentric range circles at 20,40,50m.
+    :param pc_range_regions: If given, list of {"name": str, "eval_range": [xmin,ymin,xmax,ymax]} for multi-region view.
+    :param points: Optional (N,3+) point cloud. If None and show_point_cloud, load from nusc.
     """
+    if eval_range is None:
+        eval_range = [-53.0, -53.0, 53.0, 53.0]
     # Retrieve sensor & pose records.
     sample_rec = nusc.get('sample', sample_token)
     sd_record = nusc.get('sample_data', sample_rec['data']['LIDAR_TOP'])
-    cs_record = nusc.get('calibrated_sensor', sd_record['calibrated_sensor_token'])
+    cs_record = nusc.get('calibrated_sensor',
+                         sd_record['calibrated_sensor_token'])
     pose_record = nusc.get('ego_pose', sd_record['ego_pose_token'])
 
     # Get boxes.
@@ -135,63 +376,94 @@ def visualize_sample(nusc: NuScenes,
         box_est.score = box_est_global.tracking_score
         box_est.tracking_id = box_est_global.tracking_id
 
-    # Get point cloud in lidar frame.
-    # pc, _ = CustomLidarPointCloud.from_file_multisweep(nusc, sample_rec, 'LIDAR_TOP', 'LIDAR_TOP', nsweeps=nsweeps)
+    # Load point cloud if needed.
+    pc_xy = None
+    if show_point_cloud:
+        if points is not None:
+            pc_xy = np.asarray(points)[:, :2].T
+        else:
+            try:
+                sd_token = sample_rec['data']['LIDAR_TOP']
+                pc_path = nusc.get_sample_data_path(sd_token)
+                if not os.path.isabs(pc_path):
+                    pc_path = os.path.join(nusc.dataroot, pc_path)
+                candidates = [pc_path]
+                if not pc_path.endswith(('.bin', '.pcd')):
+                    candidates.extend([pc_path + '.bin', pc_path + '.pcd'])
+                elif pc_path.endswith('.bin'):
+                    candidates.append(pc_path[:-4] + '.pcd')
+                for p in candidates:
+                    if os.path.exists(p):
+                        pts = _load_points_xyz(p)
+                        pc_xy = pts[:, :2].T
+                        break
+            except Exception:
+                pass
 
-    # Init axes.
-    if ax is None:
-        _, ax = plt.subplots(1, 1, figsize=(9, 9))
+    # Multi-region view: create subplots for each pc_range_region.
+    if pc_range_regions and len(pc_range_regions) > 1:
+        n_reg = len(pc_range_regions)
+        fig, axes = plt.subplots(1, n_reg, figsize=(6 * n_reg, 6))
+        if n_reg == 1:
+            axes = [axes]
+    else:
+        axes = [ax] if ax is not None else [plt.subplots(1, 1, figsize=(9, 9))[1]]
+        if ax is None:
+            fig = axes[0].figure
 
-    # Show point cloud.
-    # points = view_points(pc.points[:3, :], np.eye(4), normalize=False)
-    # dists = np.sqrt(np.sum(pc.points[:2, :] ** 2, axis=0))
-    # colors = np.minimum(1, dists / eval_range[2])
-    # ax.scatter(points[0, :], points[1, :], c=colors, s=0.2)
+    regions = pc_range_regions if pc_range_regions and len(pc_range_regions) > 0 else [{"name": "full", "eval_range": eval_range}]
 
-    # Show ego vehicle.
-    ax.plot(0, 0, 'x', color='black')
+    for ax_i, reg in zip(axes, regions):
+        er = reg.get("eval_range", eval_range)
+        # Show point cloud.
+        if pc_xy is not None:
+            mask = (pc_xy[0, :] >= er[0]) & (pc_xy[0, :] <= er[2]) & (pc_xy[1, :] >= er[1]) & (pc_xy[1, :] <= er[3])
+            xy = pc_xy[:, mask]
+            if xy.size > 0:
+                dists = np.sqrt(np.sum(xy ** 2, axis=0))
+                colors = np.minimum(1.0, dists / max(er[2] - er[0], 1))
+                ax_i.scatter(xy[0, :], xy[1, :], c=colors, s=0.2, cmap='viridis')
 
-    # Show GT boxes.
-    for box in boxes_gt:
-        box.render(ax, view=np.eye(4), colors=('g', 'g', 'g'), linewidth=1)
+        # Range rings.
+        if show_range_rings:
+            for r in [20, 40, 50]:
+                if er[0] <= -r and er[2] >= r and er[1] <= -r and er[3] >= r:
+                    theta = np.linspace(0, 2 * np.pi, 64)
+                    ax_i.plot(r * np.cos(theta), r * np.sin(theta), 'k--', linewidth=0.5, alpha=0.6)
 
-    # Show EST boxes.
-    for box in boxes_est:
-        # Show only predictions with a high score.
-        assert not np.isnan(box.score), 'Error: Box score cannot be NaN!'
-        if box.score >= conf_th:
-            c = 'r'
-            if hasattr(box, 'tracking_id'): # this is true
-                tr_id = box.tracking_id
-                c = color_mapping[tr_id % len(color_mapping)]
-            box.render(ax, view=np.eye(4), colors=(c, c, c), linewidth=1)
+        ax_i.plot(0, 0, 'x', color='black')
+        # Show GT boxes.
+        for box in boxes_gt:
+            box.render(ax_i, view=np.eye(4), colors=('g', 'g', 'g'), linewidth=1)
+        # Show EST boxes.
+        for box in boxes_est:
+            sc = getattr(box, 'score', 0)
+            if np.isnan(sc):
+                continue
+            if sc >= conf_th:
+                c = 'r'
+                if hasattr(box, 'tracking_id'):
+                    tr_id = box.tracking_id
+                    if isinstance(tr_id, (int, np.integer)):
+                        c = color_mapping[tr_id % len(color_mapping)]
+                box.render(ax_i, view=np.eye(4), colors=(c, c, c), linewidth=1)
 
-    # Limit visible range.
-    # axes_limit = eval_range + 3  # Slightly bigger to include boxes that extend beyond the range.
-    ax.set_xlim(eval_range[0], eval_range[2])
-    ax.set_ylim(eval_range[1], eval_range[3])
+        ax_i.set_xlim(er[0], er[2])
+        ax_i.set_ylim(er[1], er[3])
+        ax_i.set_title(reg.get('name', ''))
+        ax_i.set_aspect('equal')
 
     # Show / save plot.
     if verbose:
         print('Rendering sample token %s' % sample_token)
-    # plt.title(sample_token)
-    if eval_range[0] == -53.0:
-        ax.set_xticks([-40, -20, 0, 20, 40])
-        ax.set_xticklabels(['-40', '-20', '0', '20', '40',])
-        ax.set_yticks([-40, -20, 0, 20, 40])
-        ax.set_yticklabels(['-40', '-20', '0', '20', '40'])
-    else:
-        ax.set_xticks([20, 40, 60, 80, 100])
-        ax.set_xticklabels(['20', '40', '60', '80', '100',])
-        ax.set_yticks([-40, -20, 0, 20, 40])
-        ax.set_yticklabels(['-40', '-20', '0', '20', '40'])
-    ax.set_aspect('equal')
+    fig_use = axes[0].figure if axes else plt.gcf()
     if savepath is not None:
         savepath = savepath + '_bev'
-        plt.savefig(savepath, bbox_inches='tight', pad_inches=0.1)
-        plt.close()
+        fig_use.savefig(savepath, bbox_inches='tight', pad_inches=0.1)
+        plt.close(fig_use)
     # else:
     #     plt.show()
+
 
 def render_annotation(
         anntoken: str,
@@ -211,7 +483,8 @@ def render_annotation(
     """
     ann_record = nusc.get('sample_annotation', anntoken)
     sample_record = nusc.get('sample', ann_record['sample_token'])
-    assert 'LIDAR_TOP' in sample_record['data'].keys(), 'Error: No LIDAR_TOP in data, unable to render.'
+    assert 'LIDAR_TOP' in sample_record['data'].keys(
+    ), 'Error: No LIDAR_TOP in data, unable to render.'
 
     # Figure out which camera the object is fully visible in (this may return nothing).
     boxes, cam = [], []
@@ -236,21 +509,26 @@ def render_annotation(
     print('bbox in cams:', select_cams)
     # Plot LIDAR view.
     lidar = sample_record['data']['LIDAR_TOP']
-    data_path, boxes, camera_intrinsic = nusc.get_sample_data(lidar, selected_anntokens=[anntoken])
-    CustomLidarPointCloud.from_file(data_path).render_height(axes[0], view=view)
+    data_path, boxes, camera_intrinsic = nusc.get_sample_data(
+        lidar, selected_anntokens=[anntoken])
+    CustomLidarPointCloud.from_file(
+        data_path).render_height(axes[0], view=view)
     for box in boxes:
         c = np.array(get_color(box.name)) / 255.0
         box.render(axes[0], view=view, colors=(c, c, c))
         corners = view_points(boxes[0].corners(), view, False)[:2, :]
-        axes[0].set_xlim([np.min(corners[0, :]) - margin, np.max(corners[0, :]) + margin])
-        axes[0].set_ylim([np.min(corners[1, :]) - margin, np.max(corners[1, :]) + margin])
+        axes[0].set_xlim([np.min(corners[0, :]) - margin,
+                         np.max(corners[0, :]) + margin])
+        axes[0].set_ylim([np.min(corners[1, :]) - margin,
+                         np.max(corners[1, :]) + margin])
         axes[0].axis('off')
         axes[0].set_aspect('equal')
 
     # Plot CAMERA view.
     for i in range(1, num_cam + 1):
         cam = select_cams[i - 1]
-        data_path, boxes, camera_intrinsic = nusc.get_sample_data(cam, selected_anntokens=[anntoken])
+        data_path, boxes, camera_intrinsic = nusc.get_sample_data(
+            cam, selected_anntokens=[anntoken])
         im = Image.open(data_path)
         axes[i].imshow(im)
         axes[i].set_title(nusc.get('sample_data', cam)['channel'])
@@ -258,7 +536,8 @@ def render_annotation(
         axes[i].set_aspect('equal')
         for box in boxes:
             c = np.array(get_color(box.name)) / 255.0
-            box.render(axes[i], view=camera_intrinsic, normalize=True, colors=(c, c, c))
+            box.render(axes[i], view=camera_intrinsic,
+                       normalize=True, colors=(c, c, c))
 
         # Print extra information about the annotation below the camera view.
         axes[i].set_xlim(0, im.size[0])
@@ -272,14 +551,19 @@ def render_annotation(
         lidar_points = ann_record['num_lidar_pts']
         radar_points = ann_record['num_radar_pts']
 
-        sample_data_record = nusc.get('sample_data', sample_record['data']['LIDAR_TOP'])
-        pose_record = nusc.get('ego_pose', sample_data_record['ego_pose_token'])
-        dist = np.linalg.norm(np.array(pose_record['translation']) - np.array(ann_record['translation']))
+        sample_data_record = nusc.get(
+            'sample_data', sample_record['data']['LIDAR_TOP'])
+        pose_record = nusc.get(
+            'ego_pose', sample_data_record['ego_pose_token'])
+        dist = np.linalg.norm(
+            np.array(pose_record['translation']) - np.array(ann_record['translation']))
 
         information = ' \n'.join(['category: {}'.format(category),
                                   '',
-                                  '# lidar points: {0:>4}'.format(lidar_points),
-                                  '# radar points: {0:>4}'.format(radar_points),
+                                  '# lidar points: {0:>4}'.format(
+                                      lidar_points),
+                                  '# radar points: {0:>4}'.format(
+                                      radar_points),
                                   '',
                                   'distance: {:>7.3f}m'.format(dist),
                                   '',
@@ -287,20 +571,21 @@ def render_annotation(
                                   'length: {:>7.3f}m'.format(l),
                                   'height: {:>7.3f}m'.format(h)])
 
-        plt.annotate(information, (0, 0), (0, -20), xycoords='axes fraction', textcoords='offset points', va='top')
+        plt.annotate(information, (0, 0), (0, -20),
+                     xycoords='axes fraction', textcoords='offset points', va='top')
 
     if out_path is not None:
         plt.savefig(out_path)
-
 
 
 def get_sample_data(sample_data_token: str,
                     box_vis_level: BoxVisibility = BoxVisibility.ANY,
                     selected_anntokens=None,
                     use_flat_vehicle_coordinates: bool = False,
-                    boxes = None,
+                    boxes=None,
                     side='vehicle-side',
-                    nusc=None):
+                    nusc=None,
+                    data_root=None):
     """
     Returns the data path as well as all annotations related to that sample_data.
     Note that the boxes are transformed into the current sensor's coordinate frame.
@@ -314,34 +599,78 @@ def get_sample_data(sample_data_token: str,
 
     # Retrieve sensor & pose records
     sd_record = nusc.get('sample_data', sample_data_token)
-    # hardcode
+    sensor_record = nusc.get('sensor', nusc.get('calibrated_sensor', sd_record['calibrated_sensor_token'])['sensor_token'])
+    # For image rendering, use camera sample_data when available (provides camera_intrinsic)
+    if side in ['vehicle-side', 'cooperative'] and sensor_record['modality'] == 'lidar':
+        sample_rec = nusc.get('sample', sd_record['sample_token'])
+        cam_token = None
+        for k in ('CAM_FRONT', 'VEHICLE_CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT'):
+            if k in sample_rec.get('data', {}):
+                cam_token = sample_rec['data'][k]
+                break
+        if cam_token is not None:
+            sd_record = nusc.get('sample_data', cam_token)
+            sample_data_token = cam_token
+
+    # Use calibrated_sensor from sample_data for compatibility with different datasets
     if side in ['vehicle-side', 'cooperative']:
-        cs_record = nusc.get('calibrated_sensor', 'a4debdb5-22b2-3269-b7d7-756f1d560c92')
-        sensor2ego_rot = iterative_closest_point(np.array(cs_record['rotation']))
+        cs_record = nusc.get('calibrated_sensor',
+                             sd_record['calibrated_sensor_token'])
+        rot = cs_record['rotation']
+        rot_mat = np.array(rot) if np.array(rot).ndim == 2 else Quaternion(rot).rotation_matrix
+        sensor2ego_rot = iterative_closest_point(rot_mat)
         sensor2ego_trans = cs_record['translation']
     elif side == 'infrastructure-side':
-        cs_record = nusc.get('calibrated_sensor', '23ef3a7f-ebdc-389f-a831-34b76331632a')
+        inf_lidar_token = sample_data_token  # for calib path (lidar-to-camera)
+        cs_record = nusc.get('calibrated_sensor',
+                             sd_record['calibrated_sensor_token'])
         sensor2ego_rot = Quaternion(cs_record['rotation']).rotation_matrix
         sensor2ego_trans = cs_record['translation']
-        calib_l2c_path = data_root + side + '/calib/virtuallidar_to_camera/' + sample_data_token + '.json'
+        root = data_root if data_root else getattr(nusc, 'dataroot', '').rstrip('/').rsplit('/', 1)[0]
+        calib_l2c_path = osp.join(root, 'infrastructure-side',
+            'calib/virtuallidar_to_camera', inf_lidar_token + '.json')
         calib_l2c = read_json(calib_l2c_path)
         l2c_rot = np.array(calib_l2c['rotation'])
         appro_l2c_rot = iterative_closest_point(np.array(l2c_rot))
-        cs_record = nusc.get('calibrated_sensor', 'eda75990-71f2-387c-b06a-415a923663a9')
-        
+        # Use camera calibrated_sensor for camera_intrinsic when available
+        if sensor_record['modality'] == 'lidar':
+            sample_rec = nusc.get('sample', sd_record['sample_token'])
+            cam_token = None
+            for k in ('CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'KEY_FRAME'):
+                cam_token = sample_rec.get('data', {}).get(k)
+                if cam_token is not None:
+                    break
+            if cam_token is not None:
+                cam_sd = nusc.get('sample_data', cam_token)
+                cs_record = nusc.get('calibrated_sensor', cam_sd['calibrated_sensor_token'])
+                sd_record = cam_sd
+                sample_data_token = cam_token
+
     sensor_record = nusc.get('sensor', cs_record['sensor_token'])
     pose_record = nusc.get('ego_pose', sd_record['ego_pose_token'])
 
     data_path = nusc.get_sample_data_path(sample_data_token)
-    # hardcode
-    dir_path = data_path.split('velodyne')[0]
-    data_path = dir_path + 'image/' + sample_data_token + '.jpg'
+    if not osp.isabs(data_path):
+        data_path = osp.join(nusc.dataroot, data_path)
+    if sensor_record['modality'] != 'camera':
+        # Lidar-only: try common image paths (samples/image, velodyne/../image)
+        for sep in ('velodyne', 'LIDAR_TOP', 'lidar'):
+            if sep in data_path:
+                dir_path = data_path.split(sep)[0]
+                cand = osp.join(dir_path, 'image', sample_data_token + '.jpg')
+                if osp.isfile(cand):
+                    data_path = cand
+                    break
+                cand = osp.join(dir_path, 'samples', 'image', sample_data_token + '.jpg')
+                if osp.isfile(cand):
+                    data_path = cand
+                    break
 
     if sensor_record['modality'] == 'camera':
         cam_intrinsic = np.array(cs_record['camera_intrinsic'])
         # cam_intrinsic_path = data_root + side + '/calib/camera_intrinsic/' + sample_data_token + '.json'
         # cam_intrinsic = np.array(read_json(cam_intrinsic_path)['cam_K']).reshape(3, 3)
-        
+
         # hardcode
         imsize = (1920, 1080)
     else:
@@ -361,7 +690,8 @@ def get_sample_data(sample_data_token: str,
             # Move box to ego vehicle coord system parallel to world z plane.
             yaw = Quaternion(pose_record['rotation']).yaw_pitch_roll[0]
             box.translate(-np.array(pose_record['translation']))
-            box.rotate(Quaternion(scalar=np.cos(yaw / 2), vector=[0, 0, np.sin(yaw / 2)]).inverse)
+            box.rotate(Quaternion(scalar=np.cos(yaw / 2),
+                       vector=[0, 0, np.sin(yaw / 2)]).inverse)
         else:
             # Move box to ego vehicle coord system.
             box.translate(-np.array(pose_record['translation']))
@@ -370,7 +700,7 @@ def get_sample_data(sample_data_token: str,
             #  Move box to sensor coord system.
             box.translate(-np.array(sensor2ego_trans))
             box.rotate(Quaternion(matrix=np.array(sensor2ego_rot)).inverse)
-            
+
             if side == 'infrastructure-side':
                 # rotate
                 box.center = np.dot(l2c_rot, box.center)
@@ -386,7 +716,6 @@ def get_sample_data(sample_data_token: str,
         box_list.append(box)
 
     return data_path, box_list, cam_intrinsic
-
 
 
 # def get_predicted_data(sample_data_token: str,
@@ -424,7 +753,7 @@ def get_sample_data(sample_data_token: str,
 #         l2c_rot = np.array(calib_l2c['rotation'])
 #         appro_l2c_rot = iterative_closest_point(np.array(l2c_rot))
 #         cs_record = nusc.get('calibrated_sensor', 'eda75990-71f2-387c-b06a-415a923663a9')
-        
+
 #     sensor_record = nusc.get('sensor', cs_record['sensor_token'])
 #     pose_record = nusc.get('ego_pose', sd_record['ego_pose_token'])
 
@@ -472,33 +801,34 @@ def get_sample_data(sample_data_token: str,
 #                 box.velocity = np.dot(l2c_rot, box.velocity)
 #                 # translate
 #                 box.translate(np.squeeze(np.array(calib_l2c['translation'])))
-                
+
 #         if sensor_record['modality'] == 'camera' and not \
 #                 box_in_image(box, cam_intrinsic, imsize, vis_level=box_vis_level):
 #             continue
 #         box_list.append(box)
 
 #     return data_path, box_list, cam_intrinsic
-
 detection_mapping = {
-        'movable_object.barrier': 'barrier',
-        'vehicle.bicycle': 'bicycle',
-        'vehicle.bus.bendy': 'bus',
-        'vehicle.bus.rigid': 'bus',
-        'vehicle.car': 'car',
-        'vehicle.construction': 'construction_vehicle',
-        'vehicle.motorcycle': 'motorcycle',
-        'human.pedestrian.adult': 'pedestrian',
-        'human.pedestrian.child': 'pedestrian',
-        'human.pedestrian.construction_worker': 'pedestrian',
-        'human.pedestrian.police_officer': 'pedestrian',
-        'movable_object.trafficcone': 'traffic_cone',
-        'vehicle.trailer': 'trailer',
-        'vehicle.truck': 'truck'
-    }
+    'movable_object.barrier': 'barrier',
+    'vehicle.bicycle': 'bicycle',
+    'vehicle.bus.bendy': 'bus',
+    'vehicle.bus.rigid': 'bus',
+    'vehicle.car': 'car',
+    'vehicle.construction': 'construction_vehicle',
+    'vehicle.motorcycle': 'motorcycle',
+    'human.pedestrian.adult': 'pedestrian',
+    'human.pedestrian.child': 'pedestrian',
+    'human.pedestrian.construction_worker': 'pedestrian',
+    'human.pedestrian.police_officer': 'pedestrian',
+    'movable_object.trafficcone': 'traffic_cone',
+    'vehicle.trailer': 'trailer',
+    'vehicle.truck': 'truck'
+}
 
 
-def lidar_render(sample_token, data, ax=None, out_path=None, side='vehicle-side', thre=0.0, nusc=None):
+def lidar_render(sample_token, data, ax=None, out_path=None, side='vehicle-side', thre=0.0, nusc=None,
+                 show_point_cloud=True, show_range_rings=True, pc_range_regions=None,
+                 pc_range_override=None, pc_path_dir=None):
     bbox_gt_list = []
     bbox_pred_list = []
     anns = nusc.get('sample', sample_token)['anns']
@@ -512,37 +842,81 @@ def lidar_render(sample_token, data, ax=None, out_path=None, side='vehicle-side'
             velocity=nusc.box_velocity(content['token'])[:2],
             ego_translation=(0.0, 0.0, 0.0) if 'ego_translation' not in content
             else tuple(content['ego_translation']),
-            num_pts=-1 if 'num_pts' not in content else int(content['num_pts']),
+            num_pts=-
+            1 if 'num_pts' not in content else int(content['num_pts']),
             tracking_name=content['category_name'],
-            tracking_score=-1.0 if 'tracking_score' not in content else float(content['tracking_score']),
+            tracking_score=-
+            1.0 if 'tracking_score' not in content else float(
+                content['tracking_score']),
             tracking_id=content['instance_token']))
-
 
     bbox_anns = data['results'][sample_token]
     for content in bbox_anns:
         bbox_pred_list.append(TrackingBox(
-            sample_token=content['sample_token'],
+            sample_token=content.get('sample_token', sample_token),
             translation=tuple(content['translation']),
             size=tuple(content['size']),
             rotation=tuple(content['rotation']),
-            velocity=tuple(content['velocity']),
+            velocity=tuple(content.get('velocity', (0, 0))),
             ego_translation=(0.0, 0.0, 0.0) if 'ego_translation' not in content
             else tuple(content['ego_translation']),
             num_pts=-1 if 'num_pts' not in content else int(content['num_pts']),
-            tracking_name=content['tracking_name'],
-            tracking_score=-1.0 if 'tracking_score' not in content else float(content['tracking_score']),
-            tracking_id=content['tracking_id']))
+            tracking_name=content.get('tracking_name', content.get('detection_name', 'car')),
+            tracking_score=-1.0 if 'tracking_score' not in content and 'detection_score' not in content
+            else float(content.get('tracking_score', content.get('detection_score', -1.0))),
+            tracking_id=content.get('tracking_id', 0)))
     gt_annotations = EvalBoxes()
     pred_annotations = EvalBoxes()
     gt_annotations.add_boxes(sample_token, bbox_gt_list)
     pred_annotations.add_boxes(sample_token, bbox_pred_list)
     print('green is ground truth')
     print('blue is the predited result')
-    if side in ['vehicle-side', 'cooperative']:
+    if pc_range_override is not None:
+        eval_range = pc_range_override
+    elif side in ['vehicle-side', 'cooperative']:
         eval_range = [-53.0, -53.0, 53.0, 53.0]
     elif side == 'infrastructure-side':
         eval_range = [-3.0, -53.0, 103.0, 53.0]
-    visualize_sample(nusc, sample_token, gt_annotations, pred_annotations, conf_th=thre, savepath=out_path, eval_range=eval_range, ax=ax)
+    points = None
+    if show_point_cloud:
+        if pc_path_dir:
+            for ext in ('.bin', '.pcd.bin', '.pcd'):
+                pc_path = osp.join(pc_path_dir, sample_token + ext)
+                if osp.exists(pc_path):
+                    try:
+                        points = _load_points_xyz(pc_path)
+                        break
+                    except Exception:
+                        pass
+        if points is None:
+            # Fallback: load from nusc sample_data (LIDAR_TOP or KEY_FRAME)
+            try:
+                sample_rec = nusc.get('sample', sample_token)
+                data_dict = sample_rec.get('data', {})
+                for lidar_key in ('LIDAR_TOP', 'KEY_FRAME', 'LIDAR'):
+                    if lidar_key not in data_dict:
+                        continue
+                    sd_token = data_dict[lidar_key]
+                    pc_path = nusc.get_sample_data_path(sd_token)
+                    if not osp.isabs(pc_path):
+                        pc_path = osp.join(nusc.dataroot, pc_path)
+                    candidates = [pc_path]
+                    if pc_path.endswith('.bin'):
+                        candidates.extend([pc_path[:-4] + '.pcd'])
+                    elif not pc_path.endswith(('.bin', '.pcd')):
+                        candidates.extend([pc_path + '.bin', pc_path + '.pcd'])
+                    for p in candidates:
+                        if osp.exists(p):
+                            points = _load_points_xyz(p)
+                            break
+                    if points is not None:
+                        break
+            except Exception:
+                pass
+    visualize_sample(nusc, sample_token, gt_annotations, pred_annotations,
+                     conf_th=thre, savepath=out_path, eval_range=eval_range, ax=ax,
+                     show_point_cloud=show_point_cloud, show_range_rings=show_range_rings,
+                     pc_range_regions=pc_range_regions, points=points)
 
 
 def get_color(category_name: str):
@@ -551,18 +925,18 @@ def get_color(category_name: str):
     This method works for the general nuScenes categories, as well as the nuScenes detection categories.
     """
     a = ['noise', 'animal', 'human.pedestrian.adult', 'human.pedestrian.child', 'human.pedestrian.construction_worker',
-     'human.pedestrian.personal_mobility', 'human.pedestrian.police_officer', 'human.pedestrian.stroller',
-     'human.pedestrian.wheelchair', 'movable_object.barrier', 'movable_object.debris',
-     'movable_object.pushable_pullable', 'movable_object.trafficcone', 'static_object.bicycle_rack', 'vehicle.bicycle',
-     'vehicle.bus.bendy', 'vehicle.bus.rigid', 'vehicle.car', 'vehicle.construction', 'vehicle.emergency.ambulance',
-     'vehicle.emergency.police', 'vehicle.motorcycle', 'vehicle.trailer', 'vehicle.truck', 'flat.driveable_surface',
-     'flat.other', 'flat.sidewalk', 'flat.terrain', 'static.manmade', 'static.other', 'static.vegetation',
-     'vehicle.ego']
+         'human.pedestrian.personal_mobility', 'human.pedestrian.police_officer', 'human.pedestrian.stroller',
+         'human.pedestrian.wheelchair', 'movable_object.barrier', 'movable_object.debris',
+         'movable_object.pushable_pullable', 'movable_object.trafficcone', 'static_object.bicycle_rack', 'vehicle.bicycle',
+         'vehicle.bus.bendy', 'vehicle.bus.rigid', 'vehicle.car', 'vehicle.construction', 'vehicle.emergency.ambulance',
+         'vehicle.emergency.police', 'vehicle.motorcycle', 'vehicle.trailer', 'vehicle.truck', 'flat.driveable_surface',
+         'flat.other', 'flat.sidewalk', 'flat.terrain', 'static.manmade', 'static.other', 'static.vegetation',
+         'vehicle.ego']
     class_names = [
         'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
         'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
     ]
-    #print(category_name)
+    # print(category_name)
     if category_name == 'bicycle':
         return nusc.colormap['vehicle.bicycle']
     elif category_name == 'construction_vehicle':
@@ -577,25 +951,31 @@ def get_color(category_name: str):
 
 
 def render_sample_data(
-        sample_token: str,
-        with_anns: bool = True,
-        box_vis_level: BoxVisibility = BoxVisibility.ANY,
-        axes_limit: float = 40,
-        ax=None,
-        nsweeps: int = 1,
-        out_path: str = None,
-        underlay_map: bool = True,
-        use_flat_vehicle_coordinates: bool = True,
-        show_lidarseg: bool = False,
-        show_lidarseg_legend: bool = False,
-        filter_lidarseg_labels=None,
-        lidarseg_preds_bin_path: str = None,
-        verbose: bool = True,
-        show_panoptic: bool = False,
+    sample_token: str,
+    with_anns: bool = True,
+    box_vis_level: BoxVisibility = BoxVisibility.ANY,
+    axes_limit: float = 40,
+    ax=None,
+    nsweeps: int = 1,
+    out_path: str = None,
+    underlay_map: bool = True,
+    use_flat_vehicle_coordinates: bool = True,
+    show_lidarseg: bool = False,
+    show_lidarseg_legend: bool = False,
+    filter_lidarseg_labels=None,
+    lidarseg_preds_bin_path: str = None,
+    verbose: bool = True,
+    show_panoptic: bool = False,
         pred_data=None,
         side='vehicle-side',
         thre=None,
         nusc=None,
+        data_root=None,
+        show_point_cloud=True,
+        pc_range_regions=None,
+        pc_range_override=None,
+        pc_path_dir=None,
+        lidar_only=False,
       ) -> None:
     """
     Render sample data onto axis.
@@ -624,44 +1004,60 @@ def render_sample_data(
         If show_lidarseg is True, show_panoptic will be set to False.
     """
     sample = nusc.get('sample', sample_token)
-    # sample = data['results'][sample_token_list[0]][0]
-    if ax is None:
-        # Create a figure
-        fig = plt.figure(figsize=(24, 13))
-        gs = gridspec.GridSpec(1, 2, wspace=0.05)
-        gs0 = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=gs[0], hspace=0.05)
-        ax1 = fig.add_subplot(gs0[0, 0])
-        ax2 = fig.add_subplot(gs0[1, 0])
-        ax3 = fig.add_subplot(gs[0, 1])
-        axes = [ax1, ax2, ax3]
-
-    # hardcode
     sample_data_token = sample['data']['LIDAR_TOP']
-    
-    # plot in BEV
-    lidar_render(sample_token, pred_data, ax=axes[2], out_path=None, side=side, thre=thre, nusc=nusc)
-    
+
+    if ax is None:
+        fig = plt.figure(figsize=(12, 10) if lidar_only else (24, 13))
+        if lidar_only:
+            axes = [fig.add_subplot(1, 1, 1)]
+        else:
+            gs = gridspec.GridSpec(1, 2, wspace=0.05)
+            gs0 = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=gs[0], hspace=0.05)
+            axes = [fig.add_subplot(gs0[0, 0]), fig.add_subplot(gs0[1, 0]), fig.add_subplot(gs[0, 1])]
+
+    # plot in BEV (point cloud + pred boxes + GT)
+    lidar_render(sample_token, pred_data, ax=axes[-1], out_path=None, side=side, thre=thre, nusc=nusc,
+        show_point_cloud=show_point_cloud, pc_range_regions=pc_range_regions,
+        pc_range_override=pc_range_override, pc_path_dir=pc_path_dir)
+
+    if lidar_only:
+        if out_path is not None:
+            plt.savefig(osp.join(out_path, sample_token + '.png'), bbox_inches='tight', pad_inches=0.03, dpi=300)
+        plt.close()
+        return
+
     # plot in image
+    def _score(r):
+        return r.get('detection_score', r.get('tracking_score', 0))
+    def _name(r):
+        return r.get('detection_name', r.get('tracking_name', 'car'))
     boxes_pred = [Box(record['translation'], record['size'], Quaternion(record['rotation']),
-                    name=record['detection_name'], token=record['tracking_id']) for record in
-                pred_data['results'][sample_token] if record['detection_score'] > thre]
+                      name=_name(record), token=record.get('tracking_id', 'predicted')) for record in
+                  pred_data['results'][sample_token] if _score(record) > thre]
     boxes_gt = nusc.get_boxes(sample_data_token)
     data_path, boxes_pred, camera_intrinsic = get_sample_data(sample_data_token,
-                                                                    box_vis_level=box_vis_level, boxes=boxes_pred, side=side, nusc=nusc)
-    _, boxes_gt, _ = get_sample_data(sample_data_token, box_vis_level=box_vis_level, boxes=boxes_gt, side=side, nusc=nusc)
+        box_vis_level=box_vis_level, boxes=boxes_pred, side=side, nusc=nusc, data_root=data_root)
+    _, boxes_gt, _ = get_sample_data(sample_data_token, box_vis_level=box_vis_level,
+        boxes=boxes_gt, side=side, nusc=nusc, data_root=data_root)
 
-    data = Image.open(data_path)
+    try:
+        data = Image.open(data_path)
+    except Exception:
+        data = Image.new('RGB', (1920, 1080), (128, 128, 128))
     # Show image.
     axes[0].imshow(data)
     axes[1].imshow(data)
 
-    # Show boxes.
-    for box in boxes_pred:
-        c = np.array(get_color(box.name)) / 255.0
-        box.render(axes[0], view=camera_intrinsic, normalize=True, colors=(c, c, c), linewidth=1)
-    for box in boxes_gt:
-        c = np.array(get_color(box.name)) / 255.0
-        box.render(axes[1], view=camera_intrinsic, normalize=True, colors=(c, c, c), linewidth=1)
+    # Show boxes (skip when camera_intrinsic is None, e.g. lidar-only dataset without CAM)
+    if camera_intrinsic is not None:
+        for box in boxes_pred:
+            c = np.array(get_color(box.name)) / 255.0
+            box.render(axes[0], view=camera_intrinsic,
+                       normalize=True, colors=(c, c, c), linewidth=1)
+        for box in boxes_gt:
+            c = np.array(get_color(box.name)) / 255.0
+            box.render(axes[1], view=camera_intrinsic,
+                       normalize=True, colors=(c, c, c), linewidth=1)
 
     # Limit visible range.
     axes[0].set_xlim(0, data.size[0])
@@ -686,30 +1082,36 @@ def render_sample_data(
         plt.show()
     plt.close()
 
+
 def render_sample_data_coop(
-        sample_token: str,
-        with_anns: bool = True,
-        box_vis_level: BoxVisibility = BoxVisibility.ANY,
-        axes_limit: float = 40,
-        ax=None,
-        nsweeps: int = 1,
-        out_path: str = None,
-        underlay_map: bool = True,
-        use_flat_vehicle_coordinates: bool = True,
-        show_lidarseg: bool = False,
-        show_lidarseg_legend: bool = False,
-        filter_lidarseg_labels=None,
-        lidarseg_preds_bin_path: str = None,
-        verbose: bool = True,
-        show_panoptic: bool = False,
-        pred_data=None,
-        side='vehicle-side',
-        thre=None,
-        veh2inf=None,
+    sample_token: str,
+    with_anns: bool = True,
+    box_vis_level: BoxVisibility = BoxVisibility.ANY,
+    axes_limit: float = 40,
+    ax=None,
+    nsweeps: int = 1,
+    out_path: str = None,
+    underlay_map: bool = True,
+    use_flat_vehicle_coordinates: bool = True,
+    show_lidarseg: bool = False,
+    show_lidarseg_legend: bool = False,
+    filter_lidarseg_labels=None,
+    lidarseg_preds_bin_path: str = None,
+    verbose: bool = True,
+    show_panoptic: bool = False,
+    pred_data=None,
+    side='vehicle-side',
+    thre=None,
+    veh2inf=None,
         nusc=None,
         nusc_inf=None,
-        is_gt=False
-      ) -> None:
+        is_gt=False,
+        data_root=None,
+        show_point_cloud=True,
+        pc_range_regions=None,
+        pc_range_override=None,
+        pc_path_dir=None,
+) -> None:
     """
     Render sample data onto axis.
     :param sample_data_token: Sample_data token.
@@ -742,7 +1144,8 @@ def render_sample_data_coop(
         # Create a figure
         fig = plt.figure(figsize=(24, 13))
         gs = gridspec.GridSpec(1, 2, wspace=0.05)
-        gs0 = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=gs[0], hspace=0.05)
+        gs0 = gridspec.GridSpecFromSubplotSpec(
+            2, 1, subplot_spec=gs[0], hspace=0.05)
         ax1 = fig.add_subplot(gs0[0, 0])
         ax2 = fig.add_subplot(gs0[1, 0])
         ax3 = fig.add_subplot(gs[0, 1])
@@ -750,58 +1153,76 @@ def render_sample_data_coop(
 
     # hardcode
     sample_data_token = sample['data']['LIDAR_TOP']
-    
-    # plot in BEV
-    lidar_render(sample_token, pred_data, ax=axes[2], out_path=None, side=side, thre=thre, nusc=nusc)
-    
+
+    # plot in BEV (with point cloud and model predictions)
+    lidar_render(sample_token, pred_data, ax=axes[2], out_path=None, side=side, thre=thre, nusc=nusc,
+        show_point_cloud=show_point_cloud, pc_range_regions=pc_range_regions,
+        pc_range_override=pc_range_override, pc_path_dir=pc_path_dir)
+
     # plot in image for veh
     if is_gt:
         # load cooperative label
         boxes_gt = nusc.get_boxes(sample_data_token)
-        data_path, boxes_gt, camera_intrinsic = get_sample_data(sample_data_token, box_vis_level=box_vis_level, boxes=boxes_gt, side=side, nusc=nusc)
+        data_path, boxes_gt, camera_intrinsic = get_sample_data(
+            sample_data_token, box_vis_level=box_vis_level, boxes=boxes_gt, side=side, nusc=nusc)
     else:
+        _sc = lambda r: r.get('detection_score', r.get('tracking_score', 0))
+        _nm = lambda r: r.get('detection_name', r.get('tracking_name', 'car'))
         boxes_pred = [Box(record['translation'], record['size'], Quaternion(record['rotation']),
-                    name=record['detection_name'], token='predicted') for record in
-                pred_data['results'][sample_token] if record['detection_score'] > thre]
+                          name=_nm(record), token='predicted') for record in
+                      pred_data['results'][sample_token] if _sc(record) > thre]
         data_path, boxes_pred, camera_intrinsic = get_sample_data(sample_data_token,
-                                                                    box_vis_level=box_vis_level, boxes=boxes_pred, side=side, nusc=nusc)
+                                                                  box_vis_level=box_vis_level, boxes=boxes_pred, side=side, nusc=nusc)
     data = Image.open(data_path)
     axes[0].imshow(data)
-    # Show boxes.
-    if is_gt:
-        for box in boxes_gt:
-            c = np.array(get_color(box.name)) / 255.0
-            box.render(axes[0], view=camera_intrinsic, normalize=True, colors=(c, c, c), linewidth=1)
-    else:
-        for box in boxes_pred:
-            c = np.array(get_color(box.name)) / 255.0
-            box.render(axes[0], view=camera_intrinsic, normalize=True, colors=(c, c, c), linewidth=1)
+    if camera_intrinsic is not None:
+        if is_gt:
+            for box in boxes_gt:
+                c = np.array(get_color(box.name)) / 255.0
+                box.render(axes[0], view=camera_intrinsic,
+                           normalize=True, colors=(c, c, c), linewidth=1)
+        else:
+            for box in boxes_pred:
+                c = np.array(get_color(box.name)) / 255.0
+                box.render(axes[0], view=camera_intrinsic,
+                           normalize=True, colors=(c, c, c), linewidth=1)
 
     # plot in image for inf
     sample_data_token_inf = veh2inf[sample_data_token]
     if is_gt:
         # load cooperative label, so use nusc rather than nusc_inf
         boxes_gt = nusc.get_boxes(sample_data_token)
-        boxes_gt = veh2inf_convert(boxes_gt, data_root, veh2inf, sample_data_token)
-        data_path, boxes_gt, camera_intrinsic = get_sample_data(sample_data_token_inf, box_vis_level=box_vis_level, boxes=boxes_gt, side='infrastructure-side', nusc=nusc_inf)
+        boxes_gt = veh2inf_convert(
+            boxes_gt, data_root, veh2inf, sample_data_token)
+        data_path, boxes_gt, camera_intrinsic = get_sample_data(
+            sample_data_token_inf, box_vis_level=box_vis_level, boxes=boxes_gt, side='infrastructure-side', nusc=nusc_inf, data_root=data_root)
     else:
         # load cooperative prediction
+        _sc = lambda r: r.get('detection_score', r.get('tracking_score', 0))
+        _nm = lambda r: r.get('detection_name', r.get('tracking_name', 'car'))
         boxes = [Box(record['translation'], record['size'], Quaternion(record['rotation']),
-                        name=record['detection_name'], token='predicted') for record in
-                    pred_data['results'][sample_token] if record['detection_score'] > thre]
-        boxes_inf = veh2inf_convert(boxes, data_root, veh2inf, sample_data_token)
+                     name=_nm(record), token='predicted') for record in
+                 pred_data['results'][sample_token] if _sc(record) > thre]
+        boxes_inf = veh2inf_convert(
+            boxes, data_root, veh2inf, sample_data_token)
         data_path, boxes_pred, camera_intrinsic = get_sample_data(sample_data_token_inf,
-                                                                    box_vis_level=box_vis_level, boxes=boxes_inf, side='infrastructure-side', nusc=nusc_inf)
-    data = Image.open(data_path)
+            box_vis_level=box_vis_level, boxes=boxes_inf, side='infrastructure-side', nusc=nusc_inf, data_root=data_root)
+    try:
+        data = Image.open(data_path)
+    except Exception:
+        data = Image.new('RGB', (1920, 1080), (128, 128, 128))
     axes[1].imshow(data)
-    if is_gt:
-        for box in boxes_gt:
-            c = np.array(get_color(box.name)) / 255.0
-            box.render(axes[1], view=camera_intrinsic, normalize=True, colors=(c, c, c), linewidth=1)
-    else:
-        for box in boxes_pred:
-            c = np.array(get_color(box.name)) / 255.0
-            box.render(axes[1], view=camera_intrinsic, normalize=True, colors=(c, c, c), linewidth=1)
+    if camera_intrinsic is not None:
+        if is_gt:
+            for box in boxes_gt:
+                c = np.array(get_color(box.name)) / 255.0
+                box.render(axes[1], view=camera_intrinsic,
+                           normalize=True, colors=(c, c, c), linewidth=1)
+        else:
+            for box in boxes_pred:
+                c = np.array(get_color(box.name)) / 255.0
+                box.render(axes[1], view=camera_intrinsic,
+                           normalize=True, colors=(c, c, c), linewidth=1)
     # Limit visible range.
     axes[0].set_xlim(0, data.size[0])
     axes[0].set_ylim(data.size[1], 0)
@@ -824,7 +1245,8 @@ def render_sample_data_coop(
     else:
         plt.show()
     plt.close()
-    
+
+
 def to_video(folder_path, out_path, fps=4, downsample=1):
     imgs_path = glob.glob(os.path.join(folder_path, '*.png'))
     imgs_path = sorted(imgs_path)
@@ -833,7 +1255,7 @@ def to_video(folder_path, out_path, fps=4, downsample=1):
         img = cv2.imread(img_path)
         height, width, channel = img.shape
         img = cv2.resize(img, (width//downsample, height //
-                            downsample), interpolation=cv2.INTER_AREA)
+                               downsample), interpolation=cv2.INTER_AREA)
         height, width, channel = img.shape
         size = (width, height)
         img_array.append(img)
@@ -843,46 +1265,104 @@ def to_video(folder_path, out_path, fps=4, downsample=1):
         out.write(img_array[i])
     out.release()
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--predroot', default='test/tiny_track_r50_stream_bs8_48epoch_3cls/Sun_Dec_29_18_24_23_2024/results_nusc.json', help='Path to json')
-    parser.add_argument('--out_folder', default='result_vis/pf-track', help='Output folder path')
-    parser.add_argument('--side', default='vehicle-side', help='side')
-    parser.add_argument('--is_gt', default=True, help='plot gt')
-    parser.add_argument('--dataroot', default='datasets/V2X-Seq-SPD-Batch-65-10-10761/', help='path to data')
-    parser.add_argument('--version', default='v1.0-trainval', help='data version')
-    parser.add_argument('--thre', default=0.15, help='filter threshold')
+    parser.add_argument(
+        '--predroot', default='test/tiny_track_r50_stream_bs8_48epoch_3cls/Sun_Dec_29_18_24_23_2024/results_nusc.json', help='Path to json')
+    parser.add_argument(
+        '--out_folder', default='result_vis/pf-track', help='Output folder path')
+    parser.add_argument('--side', default='vehicle-side', help='side: vehicle-side or infrastructure-side')
+    parser.add_argument('--is_gt', dest='is_gt', action='store_true', default=True, help='plot gt (default)')
+    parser.add_argument('--no_gt', dest='is_gt', action='store_false', help='do not plot gt')
+    parser.add_argument(
+        '--dataroot', default='datasets/V2X-Seq-SPD-Batch-65-10-10761/', help='path to data')
+    parser.add_argument(
+        '--version', default='v1.0-trainval', help='data version')
+    parser.add_argument('--thre', default=0.15, type=float, help='filter threshold')
+    parser.add_argument('--show_point_cloud', action='store_true', default=True, help='show point cloud in BEV')
+    parser.add_argument('--no_point_cloud', action='store_true', help='disable point cloud overlay')
+    parser.add_argument('--pc_range', default=None,
+        help='自定义 pc_range: xmin,ymin,xmax,ymax 如 -30,-30,30,30')
+    parser.add_argument('--pc_path_dir', default=None,
+        help='点云根目录，点云路径为 {pc_path_dir}/{sample_token}.bin')
+    parser.add_argument('--pc_range_regions', nargs='+', default=None,
+        help='多区域: "name:xmin,ymin,xmax,ymax" 如 near:-30,-30,30,30 far:-53,-53,53,53')
+    parser.add_argument('--lidar_only', '--bev_only', dest='lidar_only', action='store_true',
+        help='纯lidar模式：仅输出BEV（点云+预测框+GT），不显示相机图像')
+    parser.add_argument('--gt_only', action='store_true',
+        help='仅可视化GT，不加载预测结果；从数据集获取 sample 列表')
     args = parser.parse_args()
 
-    data_root = args.dataroot
-    bevformer_results = mmcv.load(args.predroot)
+    data_root = args.dataroot.rstrip('/')
+    if args.gt_only:
+        # 从 NuScenes 获取 sample 列表，预测结果置空
+        nusc_temp = NuScenes(version=args.version,
+                             dataroot=osp.join(data_root, args.side), verbose=False)
+        sample_token_list = [s['token'] for s in nusc_temp.sample]
+        bevformer_results = {'results': {tok: [] for tok in sample_token_list}}
+    else:
+        bevformer_results = mmcv.load(args.predroot)
+    if 'results' not in bevformer_results and isinstance(bevformer_results, dict):
+        for k in ('results', 'bbox_results'):
+            if k in bevformer_results:
+                bevformer_results = {'results': bevformer_results[k]} if k == 'bbox_results' and isinstance(bevformer_results[k], dict) else bevformer_results
+                break
     # side = 'infrastructure-side' # or 'vehicle-side'
     side = args.side
     root_path = args.out_folder
-    sample_token_list = list(bevformer_results['results'].keys())[73:]
+    results = bevformer_results.get('results', bevformer_results)
+    sample_token_list = list(results.keys()) if isinstance(results, dict) else []
     thre = args.thre
     is_gt = args.is_gt
-    nusc = NuScenes(version=args.version, dataroot=data_root+side, verbose=True)
+    nusc = NuScenes(version=args.version,
+                    dataroot=osp.join(data_root, side), verbose=True)
 
     folder_path = os.path.join(root_path, side)
     video_path = os.path.join(root_path, side+'.avi')
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
-    
+
     from nuscenes.eval.common.config import config_factory
     cfg = config_factory("tracking_nips_2019")
     if side == 'cooperative':
-        inf_root = data_root + 'infrastructure-side'
-        nusc_inf = NuScenes(version=args.version, dataroot=inf_root, verbose=True)
+        inf_root = osp.join(data_root, 'infrastructure-side')
+        nusc_inf = NuScenes(version=args.version,
+                            dataroot=inf_root, verbose=True)
         veh2inf = {}
-        coop_info = read_json(os.path.join(data_root, 'cooperative/data_info.json'))
+        coop_info = read_json(os.path.join(
+            data_root, 'cooperative/data_info.json'))
         for f in coop_info:
             veh2inf[f['vehicle_frame']] = f['infrastructure_frame']
             veh2inf[f['vehicle_frame']+'offset'] = f['system_error_offset']
-            
+
+    pred_data = bevformer_results
+    if 'results' not in pred_data and isinstance(pred_data, dict) and 'bbox_results' in pred_data and isinstance(pred_data['bbox_results'], dict):
+        pred_data = {'results': pred_data['bbox_results']}
+    show_pc = getattr(args, 'show_point_cloud', True) and not getattr(args, 'no_point_cloud', False)
+    pc_range_override = None
+    if getattr(args, 'pc_range', None):
+        pc_range_override = [float(x) for x in args.pc_range.split(',')]
+        if len(pc_range_override) != 4:
+            pc_range_override = None
+    pc_path_dir = getattr(args, 'pc_path_dir', None)
+    pc_regions = None
+    default_rng = pc_range_override if pc_range_override is not None else [-53, -53, 53, 53]
+    if getattr(args, 'pc_range_regions', None):
+        pc_regions = []
+        for s in args.pc_range_regions:
+            parts = s.split(':', 1)
+            name = parts[0]
+            rng = [float(x) for x in parts[1].split(',')] if len(parts) > 1 else default_rng
+            pc_regions.append({'name': name, 'eval_range': rng})
+    lidar_only = getattr(args, 'lidar_only', False)
     for id in range(len(sample_token_list)):
         if side != 'cooperative':
-            render_sample_data(sample_token_list[id], pred_data=bevformer_results, out_path=folder_path, side=side, thre=thre, nusc=nusc)
+            render_sample_data(sample_token_list[id], pred_data=pred_data, out_path=folder_path, side=side,
+                thre=thre, nusc=nusc, data_root=data_root, show_point_cloud=show_pc, pc_range_regions=pc_regions,
+                pc_range_override=pc_range_override, pc_path_dir=pc_path_dir, lidar_only=lidar_only)
         else:
-            render_sample_data_coop(sample_token_list[id], pred_data=bevformer_results, out_path=folder_path, side=side, thre=thre, veh2inf=veh2inf, nusc=nusc, nusc_inf=nusc_inf, is_gt=is_gt)
+            render_sample_data_coop(sample_token_list[id], pred_data=pred_data, out_path=folder_path,
+                side=side, thre=thre, veh2inf=veh2inf, nusc=nusc, nusc_inf=nusc_inf, is_gt=is_gt, data_root=data_root,
+                show_point_cloud=show_pc, pc_range_regions=pc_regions, pc_range_override=pc_range_override, pc_path_dir=pc_path_dir)
     to_video(folder_path=folder_path, out_path=video_path)

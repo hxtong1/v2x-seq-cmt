@@ -200,16 +200,18 @@ def custom_train_detector(model,
             runner.register_hook(hook, priority=priority)
 
     if cfg.resume_from and os.path.exists(cfg.resume_from):
+        resume_optimizer = cfg.get('resume_optimizer', True)
         try:
-            runner.resume(cfg.resume_from)
-        except ValueError as err:
-            logger.warning(
-                'resume_from failed (%s); fallback to load_checkpoint without '
-                'optimizer state: %s',
-                type(err).__name__,
-                err,
-            )
-            runner.load_checkpoint(cfg.resume_from)
+            runner.resume(cfg.resume_from, resume_optimizer=resume_optimizer)
+        except (ValueError, RuntimeError) as err:
+            # Optimizer state shape mismatch when resuming from different architecture
+            if resume_optimizer and ('size' in str(err).lower() or 'shape' in str(err).lower() or 'match' in str(err).lower()):
+                logger.warning(
+                    'Optimizer state mismatch (likely different architecture); '
+                    'resuming without optimizer: %s', err)
+                runner.resume(cfg.resume_from, resume_optimizer=False)
+            else:
+                raise
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)

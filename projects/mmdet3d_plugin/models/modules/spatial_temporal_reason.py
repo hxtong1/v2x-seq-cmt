@@ -158,11 +158,21 @@ class SpatialTemporalReasoner(nn.Module):
                 pos_embed=ts_pe,
                 query_key_padding_mask=hist_padding_mask[:, -1:],
                 key_padding_mask=hist_padding_mask)[:, 0, :]
-            track_instances.cache_motion_feats[valid_idxes] = mot_embed.clone()
-            track_instances.hist_motion_embeds[valid_idxes, -1] = mot_embed.clone().detach()
+            mot_embed_store = mot_embed.to(
+                device=track_instances.cache_motion_feats.device,
+                dtype=track_instances.cache_motion_feats.dtype)
+            track_instances.cache_motion_feats[valid_idxes] = mot_embed_store
+            track_instances.hist_motion_embeds[valid_idxes, -1] = mot_embed_store.detach().to(
+                device=track_instances.hist_motion_embeds.device,
+                dtype=track_instances.hist_motion_embeds.dtype)
         
-        track_instances.cache_query_feats[valid_idxes] = spatial_embed.clone()
-        track_instances.hist_embeds[valid_idxes, -1] = spatial_embed.clone().detach()
+        spatial_embed_store = spatial_embed.to(
+            device=track_instances.cache_query_feats.device,
+            dtype=track_instances.cache_query_feats.dtype)
+        track_instances.cache_query_feats[valid_idxes] = spatial_embed_store
+        track_instances.hist_embeds[valid_idxes, -1] = spatial_embed_store.detach().to(
+            device=track_instances.hist_embeds.device,
+            dtype=track_instances.hist_embeds.dtype)
         return track_instances
     
     def forward_history_refine(self, track_instances: Instances):
@@ -178,9 +188,16 @@ class SpatialTemporalReasoner(nn.Module):
         
         """Classification"""
         logits = self.track_cls(track_instances.cache_query_feats[valid_idxes])
+        # Keep mixed-precision safe: cast source to destination dtype before indexed writes.
+        logits_to_store = logits.to(
+            device=track_instances.cache_logits.device,
+            dtype=track_instances.cache_logits.dtype)
         # track_instances.hist_logits[valid_idxes, -1, :] = logits.clone()
-        track_instances.cache_logits[valid_idxes] = logits.clone()
-        track_instances.cache_scores = logits.sigmoid().max(dim=-1).values
+        track_instances.cache_logits[valid_idxes] = logits_to_store
+        scores = logits.sigmoid().max(dim=-1).values
+        track_instances.cache_scores[valid_idxes] = scores.to(
+            device=track_instances.cache_scores.device,
+            dtype=track_instances.cache_scores.dtype)
 
         """Localization"""
         if self.is_motion:
@@ -197,10 +214,15 @@ class SpatialTemporalReasoner(nn.Module):
         deltas[..., [0, 1, 4]] += reference
         deltas[..., [0, 1, 4]] = deltas[..., [0, 1, 4]].sigmoid()
 
-        track_instances.cache_ref_pts[valid_idxes] = deltas[..., [0, 1, 4]].clone()
+        refined_ref_pts = deltas[..., [0, 1, 4]].clone().to(
+            device=track_instances.cache_ref_pts.device,
+            dtype=track_instances.cache_ref_pts.dtype)
+        track_instances.cache_ref_pts[valid_idxes] = refined_ref_pts
         # track_instances.hist_xyz[valid_idxes, -1, :] = deltas[..., [0, 1, 4]].clone()
         deltas[..., [0, 1, 4]] = denormalize(deltas[..., [0, 1, 4]], self.pc_range)
-        track_instances.cache_bboxes[valid_idxes, :] = deltas
+        track_instances.cache_bboxes[valid_idxes, :] = deltas.to(
+            device=track_instances.cache_bboxes.device,
+            dtype=track_instances.cache_bboxes.dtype)
         # track_instances.hist_bboxes[valid_idxes, -1, :] = deltas.clone()
         return track_instances
 
@@ -249,8 +271,14 @@ class SpatialTemporalReasoner(nn.Module):
         fused_instances = self._query_fusion(inf_instances, veh_instances, inf_idx, veh_idx)
         res_instances = self._query_complementation(inf_instances, veh_instances, inf_idx, veh_idx, fused_instances)
 
-        res_instances.cache_query_feats = self.cross_domain_query(torch.cat([res_instances.cache_query_feats, res_instances.cache_query_embeds], dim=-1))
-        res_instances.cache_motion_feats = self.cross_domain_motion(torch.cat([res_instances.cache_motion_feats, res_instances.cache_query_embeds], dim=-1))
+        res_instances.cache_query_feats = self.cross_domain_query(
+            torch.cat([res_instances.cache_query_feats, res_instances.cache_query_embeds], dim=-1))
+        if self.is_motion:
+            res_instances.cache_motion_feats = self.cross_domain_motion(
+                torch.cat([res_instances.cache_motion_feats, res_instances.cache_query_embeds], dim=-1))
+        else:
+            # Motion branch disabled: keep a query-feature proxy for downstream code paths.
+            res_instances.cache_motion_feats = res_instances.cache_query_feats.clone()
         return res_instances, affinity
 
     def _query_fusion(self, inf, veh, inf_idx, veh_idx):
@@ -267,8 +295,13 @@ class SpatialTemporalReasoner(nn.Module):
         """
         matched_veh = veh[veh_idx]
         matched_inf = inf[inf_idx]
-        matched_veh.cache_query_feats = self.fuse_feats(torch.cat([matched_veh.cache_query_feats, matched_inf.cache_query_feats], dim=-1))
-        matched_veh.cache_motion_feats = self.fuse_motion(torch.cat([matched_veh.cache_motion_feats, matched_inf.cache_motion_feats], dim=-1))
+        matched_veh.cache_query_feats = self.fuse_feats(
+            torch.cat([matched_veh.cache_query_feats, matched_inf.cache_query_feats], dim=-1))
+        if self.is_motion:
+            matched_veh.cache_motion_feats = self.fuse_motion(
+                torch.cat([matched_veh.cache_motion_feats, matched_inf.cache_motion_feats], dim=-1))
+        else:
+            matched_veh.cache_motion_feats = matched_veh.cache_query_feats.clone()
         matched_veh.cache_query_embeds = self.fuse_embed(torch.cat([matched_veh.cache_query_embeds, matched_inf.cache_query_embeds], dim=-1))
         matched_veh.cache_ref_pts = (matched_veh.cache_ref_pts + matched_inf.cache_ref_pts) / 2.0
         return matched_veh
@@ -328,8 +361,15 @@ class SpatialTemporalReasoner(nn.Module):
         veh_ref_pts = veh.cache_ref_pts.clone()
         # 1. construct graph
         # 1.1 prepare nodes
-        inf_nodes = self.get_node_inf(torch.cat([inf_query, inf_motion], dim=-1))
-        veh_nodes = self.get_node_veh(torch.cat([veh_query, veh_motion], dim=-1))
+        if self.is_motion:
+            inf_node_feats = torch.cat([inf_query, inf_motion], dim=-1)
+            veh_node_feats = torch.cat([veh_query, veh_motion], dim=-1)
+        else:
+            # Motion branch disabled: association relies on appearance/query features only.
+            inf_node_feats = torch.cat([inf_query, inf_query], dim=-1)
+            veh_node_feats = torch.cat([veh_query, veh_query], dim=-1)
+        inf_nodes = self.get_node_inf(inf_node_feats)
+        veh_nodes = self.get_node_veh(veh_node_feats)
 
         # 1.2 prepare edges
         dis = veh_ref_pts.unsqueeze(1) - inf_ref_pts
@@ -626,6 +666,8 @@ class SpatialTemporalReasoner(nn.Module):
                 track_instances.pred_boxes = track_instances.fut_bboxes[:, 0, :].clone()
         else:
             velos = track_instances.pred_boxes[..., 8:10].clone()
+            # Clamp velocity to avoid extreme motion leading to tracker collapse
+            velos = torch.clamp(velos, min=-50.0, max=50.0)
             reference_points = track_instances.ref_pts.clone()
             velos[:, 0] /= (self.pc_range[3] - self.pc_range[0])
             velos[:, 1] /= (self.pc_range[4] - self.pc_range[1])
@@ -666,8 +708,9 @@ class SpatialTemporalReasoner(nn.Module):
             track_instances.hist_scores[:, 1:], track_instances.cache_scores[:, None]), dim=1)
         # motion features
         track_instances.hist_motion_embeds = track_instances.hist_motion_embeds.clone()
+        motion_src = track_instances.cache_motion_feats if self.is_motion else track_instances.cache_query_feats
         track_instances.hist_motion_embeds = torch.cat((
-            track_instances.hist_motion_embeds[:, 1:, :], track_instances.cache_motion_feats[:, None, :]), dim=1)
+            track_instances.hist_motion_embeds[:, 1:, :], motion_src[:, None, :]), dim=1)
         """2. Temporarily load motion predicted results as final results"""
         if self.future_reasoning:
             track_instances.ref_pts = track_instances.fut_xyz[:, 0, :].clone()

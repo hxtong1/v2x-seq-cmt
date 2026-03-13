@@ -1,8 +1,4 @@
-# ---------------------------------------------------------------------------------#
-# UniAD: Planning-oriented Autonomous Driving (https://arxiv.org/abs/2212.10156)  #
-# Source code: https://github.com/OpenDriveLab/UniAD                              #
-# Copyright (c) OpenDriveLab. All rights reserved.                                #
-# ---------------------------------------------------------------------------------#
+
 
 import torch
 import torch.nn as nn
@@ -27,6 +23,7 @@ from ..modules import SpatialTemporalReasoner, LatentTransformation
 from ..modules import pos2posemb3d
 from torchvision.ops import sigmoid_focal_loss
 from projects.mmdet3d_plugin import SPConvVoxelization
+from scipy.optimize import linear_sum_assignment
 
 
 def pop_elem_in_result(task_result: dict, pop_list: list = None):
@@ -72,7 +69,7 @@ class CMTCoopTracker(MVXTwoStageDetector):
         freeze_pts_neck=False,
         freeze_bn=False,
         freeze_bev_encoder=False,
-        queue_length=3,
+        queue_length=5,
         is_cooperation=False,
         train_track=False,
         read_track_query_file_root=None,
@@ -89,6 +86,7 @@ class CMTCoopTracker(MVXTwoStageDetector):
         random_drop=0.1,
         shuffle=False,
         is_motion=False,
+        class_birth_thresholds=None,
         asso_loss_cfg=None,
         **kwargs
     ):
@@ -130,6 +128,17 @@ class CMTCoopTracker(MVXTwoStageDetector):
         self.runtime_tracker = RunTimeTracker(
             **runtime_tracker
         )
+        if class_birth_thresholds is not None:
+            class_birth_thresholds = torch.as_tensor(
+                class_birth_thresholds, dtype=torch.float32)
+            if class_birth_thresholds.numel() != self.num_classes:
+                raise ValueError(
+                    f"class_birth_thresholds length {class_birth_thresholds.numel()} "
+                    f"must equal num_classes {self.num_classes}")
+            self.register_buffer(
+                "class_birth_thresholds", class_birth_thresholds, persistent=False)
+        else:
+            self.class_birth_thresholds = None
         if pts_voxel_layer:
             self.pts_voxel_layer = SPConvVoxelization(**pts_voxel_layer)
         # for test memory
@@ -161,6 +170,17 @@ class CMTCoopTracker(MVXTwoStageDetector):
         # cross-agent query interaction
         self.is_cooperation = is_cooperation
         self.read_track_query_file_root = read_track_query_file_root
+        if self.is_cooperation:
+            self.crossview_alignment = LatentTransformation(
+                embed_dims=embed_dims,
+                head=16,
+                rot_dims=6,
+                trans_dims=3,
+                pc_range=pc_range,
+                inf_pc_range=inf_pc_range,
+            )
+            if self.STReasoner.learn_match and asso_loss_cfg is not None:
+                self.asso_loss_focal = asso_loss_cfg['loss_focal']
 
         self.drop_rate = drop_rate
 
@@ -169,9 +189,12 @@ class CMTCoopTracker(MVXTwoStageDetector):
 
         self.seq_mode = seq_mode
         self.train_track = train_track
+        self.batch_size = batch_size
+        # Keep this flag available in both tracking and pure-detection modes.
+        self.test_flag = False
+        # Initialize cache container to avoid attribute errors in non-seq mode.
+        self.train_prev_infos = None
         if self.seq_mode:
-            self.batch_size = batch_size
-            self.test_flag = False
             # for stream train memory
             self.train_prev_infos = {
                 'scene_token': [None] * self.batch_size,
@@ -243,7 +266,20 @@ class CMTCoopTracker(MVXTwoStageDetector):
                                                            l2g_t, l2g_r_mat, img_metas, timestamp, veh2inf_rt, **kwargs)
             losses.update(losses_track)
         else:
-            pts_feats = self.extract_pts_feat(points)
+            # Inject gt into img_metas so prepare_for_dn (denoising) gets valid GT
+            bs = len(img_metas) if isinstance(
+                img_metas, (list, tuple)) else len(img_metas)
+            for j in range(bs):
+                m = img_metas[j] if isinstance(
+                    img_metas, (list, tuple)) else img_metas.get(j)
+                if m is None:
+                    continue
+                if gt_bboxes_3d is not None and j < len(gt_bboxes_3d):
+                    m['gt_bboxes_3d'] = gt_bboxes_3d[j]
+                if gt_labels_3d is not None and j < len(gt_labels_3d):
+                    m['gt_labels_3d'] = gt_labels_3d[j]
+            pts_feats = self.extract_pts_feat(
+                points, img_feats=None, img_metas=img_metas)
             outs = self.pts_bbox_head(
                 pts_feats, img_feats=None, img_metas=img_metas)
             loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
@@ -277,20 +313,30 @@ class CMTCoopTracker(MVXTwoStageDetector):
         points = points[0]
         img_metas = img_metas[0]
         timestamp = timestamp[0] if timestamp is not None else None
+        l2g_t = l2g_t[0] if l2g_t is not None else None
+        l2g_r_mat = l2g_r_mat[0] if l2g_r_mat is not None else None
+        veh2inf_rt = veh2inf_rt[0] if veh2inf_rt is not None else None
 
         result = [dict() for i in range(len(img_metas))]
-        result_track = self.simple_test_track(
-            points, l2g_t, l2g_r_mat, img_metas, timestamp, veh2inf_rt, **kwargs)
-
-        pop_track_list = ['prev_bev', 'bev_pos', 'bev_embed',
-                          'track_query_embeddings', 'sdc_embedding']
-        result_track[0] = pop_elem_in_result(result_track[0], pop_track_list)
+        if not self.train_track:
+            # Pure det path (mirror cmt.py): no track, no STReasoner, no runtime_tracker
+            result_det = self.simple_test_det(points, img_metas)
+        else:
+            result_track = self.simple_test_track(
+                points, l2g_t, l2g_r_mat, img_metas, timestamp, veh2inf_rt, **kwargs)
+            pop_track_list = ['prev_bev', 'bev_pos', 'bev_embed',
+                              'track_query_embeddings', 'sdc_embedding']
+            result_track[0] = pop_elem_in_result(
+                result_track[0], pop_track_list)
+            result_det = result_track
         for i, res in enumerate(result):
             res['token'] = img_metas[i]['sample_idx']
-            res.update(result_track[i])
+            res.update(result_det[i])
         return result
 
     def reset_memory(self):
+        if self.train_prev_infos is None:
+            return
         self.train_prev_infos['scene_token'] = [None] * self.batch_size
         self.train_prev_infos['prev_timestamp'] = [None] * self.batch_size
         self.train_prev_infos['track_instances'] = [None] * self.batch_size
@@ -317,8 +363,12 @@ class CMTCoopTracker(MVXTwoStageDetector):
         ref_pts = ref_pts @ l2g_r1 + l2g_t1 - l2g_t2
 
         # Avoid CUBLAS / cusolver errors by transposing
-        # l2g_r2 is a rotation matrix, its inverse is its transpose
-        g2l_r2 = l2g_r2.transpose(0, 1)
+        # l2g_r2 is a rotation matrix, its inverse is its transpose.
+        # Ensure it works for both batched (e.g. [1, 3, 3]) and non-batched ([3, 3]) inputs
+        if l2g_r2.dim() == 3:
+            g2l_r2 = l2g_r2.transpose(1, 2)
+        else:
+            g2l_r2 = l2g_r2.transpose(0, 1)
 
         ref_pts = ref_pts @ g2l_r2
         ref_pts = normalize(ref_pts, pc_range)
@@ -465,6 +515,88 @@ class CMTCoopTracker(MVXTwoStageDetector):
 
         return track_instances.to(device)
 
+    def _init_inf_tracks(self, inf_dict):
+        """Initialize track instances from infrastructure query dict."""
+        track_instances = Instances((1, 1))
+        device = inf_dict['ref_pts'].device
+        n = inf_dict['ref_pts'].shape[0]
+
+        track_instances.ref_pts = inf_dict['ref_pts'].clone()
+        track_instances.query_embeds = inf_dict['query_embeds'].clone()
+        track_instances.query_feats = inf_dict['query_feats'].clone()
+        if inf_dict.get('cache_motion_feats') is not None:
+            track_instances.cache_motion_feats = inf_dict['cache_motion_feats'].clone(
+            )
+        else:
+            track_instances.cache_motion_feats = torch.zeros(
+                (n, self.embed_dims), dtype=torch.float, device=device)
+        track_instances.pred_boxes = inf_dict['pred_boxes'].clone()
+
+        track_instances.obj_idxes = torch.full(
+            (n,), -1, dtype=torch.long, device=device)
+        track_instances.matched_gt_idxes = torch.full(
+            (n,), -1, dtype=torch.long, device=device)
+        track_instances.disappear_time = torch.zeros(
+            (n,), dtype=torch.long, device=device)
+        track_instances.track_query_mask = torch.zeros(
+            (n,), dtype=torch.bool, device=device)
+
+        track_instances.pred_logits = torch.zeros(
+            (n, self.num_classes), dtype=torch.float, device=device)
+        track_instances.scores = torch.zeros(
+            (n,), dtype=torch.float, device=device)
+        track_instances.iou = torch.zeros(
+            (n,), dtype=torch.float, device=device)
+        track_instances.track_scores = torch.zeros(
+            (n,), dtype=torch.float, device=device)
+        track_instances.motion_predictions = torch.zeros(
+            (n, self.fut_len, 3), dtype=torch.float, device=device)
+
+        track_instances.cache_logits = torch.zeros(
+            (n, self.num_classes), dtype=torch.float, device=device)
+        track_instances.cache_scores = torch.zeros(
+            (n,), dtype=torch.float, device=device)
+        track_instances.cache_ref_pts = inf_dict['ref_pts'].clone()
+        track_instances.cache_query_embeds = inf_dict['query_embeds'].clone()
+        track_instances.cache_query_feats = inf_dict['query_feats'].clone()
+        track_instances.cache_motion_predictions = torch.zeros_like(
+            track_instances.motion_predictions)
+        track_instances.cache_bboxes = inf_dict['pred_boxes'].clone()
+
+        track_instances.hist_embeds = torch.zeros(
+            (n, self.hist_len, self.embed_dims), dtype=torch.float32, device=device)
+        track_instances.hist_padding_masks = torch.ones(
+            (n, self.hist_len), dtype=torch.bool, device=device)
+        track_instances.hist_xyz = torch.zeros(
+            (n, self.hist_len, 3), dtype=torch.float, device=device)
+        track_instances.hist_position_embeds = torch.zeros(
+            (n, self.hist_len, self.embed_dims), dtype=torch.float32, device=device)
+        track_instances.hist_bboxes = torch.zeros(
+            (n, self.hist_len, 10), dtype=torch.float, device=device)
+        track_instances.hist_logits = torch.zeros(
+            (n, self.hist_len, self.num_classes), dtype=torch.float, device=device)
+        track_instances.hist_scores = torch.zeros(
+            (n, self.hist_len), dtype=torch.float, device=device)
+        track_instances.hist_motion_embeds = torch.zeros(
+            (n, self.hist_len, self.embed_dims), dtype=torch.float32, device=device)
+
+        track_instances.fut_embeds = torch.zeros(
+            (n, self.fut_len, self.embed_dims), dtype=torch.float32, device=device)
+        track_instances.fut_padding_masks = torch.ones(
+            (n, self.fut_len), dtype=torch.bool, device=device)
+        track_instances.fut_xyz = torch.zeros(
+            (n, self.fut_len, 3), dtype=torch.float, device=device)
+        track_instances.fut_position_embeds = torch.zeros(
+            (n, self.fut_len, self.embed_dims), dtype=torch.float32, device=device)
+        track_instances.fut_bboxes = torch.zeros(
+            (n, self.fut_len, 10), dtype=torch.float, device=device)
+        track_instances.fut_logits = torch.zeros(
+            (n, self.fut_len, self.num_classes), dtype=torch.float, device=device)
+        track_instances.fut_scores = torch.zeros(
+            (n, self.fut_len), dtype=torch.float, device=device)
+
+        return track_instances
+
     def load_detection_output_into_cache(self, track_instances: Instances, out):
         """ Load output of the detection head into the track_instances cache (inplace)
         """
@@ -482,38 +614,44 @@ class CMTCoopTracker(MVXTwoStageDetector):
         track_instances.cache_bboxes = out['all_bbox_preds'][-1].clone()
         track_instances.cache_query_embeds = self.query_embedding(
             pos2posemb3d(track_instances.cache_ref_pts))
+        if not self.is_motion:
+            # No explicit motion extractor: use query features as motion proxy.
+            track_instances.cache_motion_feats = track_instances.cache_query_feats.clone()
         return track_instances
 
     def frame_summarization(self, track_instances, tracking=False):
         """ Load the results after spatial-temporal reasoning into track instances
         """
+        # Always update current frame predictions for all queries so that detection eval (mAP)
+        # can use the full spectrum of scores/boxes rather than being thresholded.
+        track_instances.pred_boxes = track_instances.cache_bboxes.clone()
+        track_instances.pred_logits = track_instances.cache_logits.clone()
+        track_instances.scores = track_instances.cache_scores.clone()
+        if hasattr(track_instances, "track_scores"):
+            track_instances.track_scores = track_instances.cache_scores.clone()
+
         # inference mode
         if tracking:
             active_mask = (track_instances.cache_scores >=
                            self.runtime_tracker.record_threshold)
-            # print(f"update instance: {track_instances.obj_idxes[active_mask]}")
-            # active_mask = (track_instances.cache_scores >= 0.0)
         # training mode
         else:
-            track_instances.pred_boxes = track_instances.cache_bboxes.clone()
-            track_instances.pred_logits = track_instances.cache_logits.clone()
-            track_instances.scores = track_instances.cache_scores.clone()
-            track_instances.track_scores = track_instances.cache_scores.clone()
             active_mask = (track_instances.cache_scores >= 0.0)
 
-        track_instances.pred_logits[active_mask] = track_instances.cache_logits[active_mask]
-        track_instances.scores[active_mask] = track_instances.cache_scores[active_mask]
-        track_instances.track_scores[active_mask] = track_instances.cache_scores[active_mask]
-        track_instances.pred_boxes[active_mask] = track_instances.cache_bboxes[active_mask]
+        # For ST reasoning states (ref_pts, embeds, feats, motions), only update the active ones
+        # so that inactive/dead tracks don't propagate garbage state.
         ref_pts = track_instances.ref_pts.clone()
         ref_pts[active_mask] = track_instances.cache_ref_pts[active_mask]
         track_instances.ref_pts = ref_pts
+
         query_embeds = track_instances.query_embeds.clone()
         query_embeds[active_mask] = track_instances.cache_query_embeds[active_mask]
         track_instances.query_embeds = query_embeds
+
         query_feats = track_instances.query_feats.clone()
         query_feats[active_mask] = track_instances.cache_query_feats[active_mask]
         track_instances.query_feats = query_feats
+
         track_instances.motion_predictions[active_mask] = track_instances.cache_motion_predictions[active_mask]
 
         if self.STReasoner.future_reasoning:
@@ -574,6 +712,182 @@ class CMTCoopTracker(MVXTwoStageDetector):
             track_instances.track_query_mask[query_inds] = True
         return track_instances
 
+    def _compute_refinement_loss(self, track_instances,
+                                 gt_bboxes_3d, gt_labels_3d, gt_inds=None, prefix=''):
+        """Compute refinement loss (classification + full box regression) on post-STReasoner cache outputs.
+        Uses ID-aware matching if gt_inds is provided, falling back to Hungarian matching for remaining instances.
+        """
+        device = track_instances.cache_logits.device
+        N = len(track_instances)
+
+        cache_logits = track_instances.cache_logits
+        cache_bboxes = track_instances.cache_bboxes
+        cache_ref_pts = track_instances.cache_ref_pts
+
+        gt_bboxes = gt_bboxes_3d[0] if isinstance(
+            gt_bboxes_3d, (list, tuple)) else gt_bboxes_3d
+        gt_labels = gt_labels_3d[0] if isinstance(
+            gt_labels_3d, (list, tuple)) else gt_labels_3d
+        gt_boxes_tensor = gt_bboxes.tensor.to(device) if hasattr(
+            gt_bboxes, 'tensor') else gt_bboxes.to(device)
+        gt_labels = gt_labels.to(device)
+        num_gts = len(gt_labels)
+
+        if num_gts == 0 or N == 0:
+            zero = cache_logits.sum() * 0.0 + cache_bboxes.sum() * 0.0
+            one = torch.tensor(1.0, device=device)
+            return {
+                f'{prefix}loss_cls': zero, f'{prefix}avg_factor_cls': one,
+                f'{prefix}loss_bbox': zero.clone(), f'{prefix}avg_factor_bbox': one.clone(),
+            }
+
+        # 1. ID-aware matching
+        row_ind = []
+        col_ind = []
+        unmatched_rows = list(range(N))
+        unmatched_cols = list(range(num_gts))
+
+        if gt_inds is not None:
+            gt_inds_tensor = gt_inds[0] if isinstance(
+                gt_inds, (list, tuple)) else gt_inds
+            obj_idx_to_gt = {int(oid): gi for gi, oid in enumerate(
+                gt_inds_tensor.cpu().numpy().tolist())}
+
+            for r, oid in enumerate(track_instances.obj_idxes):
+                cpu_id = int(oid.cpu())
+                if cpu_id in obj_idx_to_gt:
+                    c = obj_idx_to_gt[cpu_id]
+                    row_ind.append(r)
+                    col_ind.append(c)
+                    if r in unmatched_rows:
+                        unmatched_rows.remove(r)
+                    if c in unmatched_cols:
+                        unmatched_cols.remove(c)
+
+        num_pos = len(row_ind)
+
+        # 2. Fallback Hungarian for unmatched queries/GTs
+        if len(unmatched_rows) > 0 and len(unmatched_cols) > 0:
+            pc = self.pc_range
+            unmatched_gt_cx = (
+                gt_boxes_tensor[unmatched_cols, 0] - pc[0]) / (pc[3] - pc[0])
+            unmatched_gt_cy = (
+                gt_boxes_tensor[unmatched_cols, 1] - pc[1]) / (pc[4] - pc[1])
+            unmatched_gt_cz = (
+                gt_boxes_tensor[unmatched_cols, 2] - pc[2]) / (pc[5] - pc[2])
+            unmatched_gt_pos = torch.stack(
+                [unmatched_gt_cx, unmatched_gt_cy, unmatched_gt_cz], dim=-1).float()
+
+            unmatched_pred_pos = cache_ref_pts[unmatched_rows].float()
+
+            with torch.no_grad():
+                cost_pos = torch.cdist(
+                    unmatched_pred_pos, unmatched_gt_pos, p=1)
+                cls_scores = cache_logits[unmatched_rows].float().sigmoid()
+                neg = -(1 - cls_scores + 1e-8).log() * \
+                    (1 - 0.25) * cls_scores.pow(2.0)
+                pos = -(cls_scores + 1e-8).log() * \
+                    0.25 * (1 - cls_scores).pow(2.0)
+                unmatched_gt_labels = gt_labels[unmatched_cols]
+                cls_cost = pos[:, unmatched_gt_labels] - \
+                    neg[:, unmatched_gt_labels]
+                cost = cls_cost + 5.0 * cost_pos
+                r_ind, c_ind = linear_sum_assignment(cost.cpu().numpy())
+
+                for r, c in zip(r_ind, c_ind):
+                    row_ind.append(unmatched_rows[r])
+                    col_ind.append(unmatched_cols[c])
+
+        num_matched = len(row_ind)
+        num_neg = N - num_matched
+
+        # Classification loss (Focal Loss)
+        target_cls = cache_logits.new_zeros((N, self.num_classes))
+        for r, c in zip(row_ind, col_ind):
+            target_cls[r, gt_labels[c]] = 1.0
+
+        bg_cls_weight = 0.2
+        cls_avg_factor = num_pos * 1.0 + num_neg * bg_cls_weight
+        cls_avg_factor = float(max(cls_avg_factor, 1.0))
+
+        loss_cls = sigmoid_focal_loss(
+            cache_logits.float(), target_cls.float(),
+            alpha=0.25, gamma=2.0, reduction='sum')
+
+        # Regression loss (Full BBox)
+        if num_matched > 0:
+            pred_bboxes = cache_bboxes[row_ind]
+            target_bboxes = gt_boxes_tensor[col_ind].float()
+
+            normalized_bbox_targets = normalize_bbox(
+                target_bboxes, self.pc_range)
+            isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
+
+            code_weights = [2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+            bbox_weights = torch.tensor(code_weights, device=device).unsqueeze(
+                0).expand(num_matched, -1)
+
+            pred_bboxes = pred_bboxes[isnotnan, :10]
+            target_bboxes = normalized_bbox_targets[isnotnan, :10]
+            bbox_weights = bbox_weights[isnotnan, :10]
+
+            loss_bbox = F.l1_loss(pred_bboxes * bbox_weights,
+                                  target_bboxes * bbox_weights, reduction='sum')
+        else:
+            loss_bbox = cache_bboxes.sum() * 0.0
+
+        box_avg_factor = float(max(num_matched, 1))
+        return {
+            f'{prefix}loss_cls': loss_cls / cls_avg_factor,
+            f'{prefix}avg_factor_cls': torch.tensor(cls_avg_factor, device=device),
+            f'{prefix}loss_bbox': loss_bbox / box_avg_factor,
+            f'{prefix}avg_factor_bbox': torch.tensor(box_avg_factor, device=device),
+        }
+
+    def forward_loss_prediction(self, active_track_instances,
+                                gt_trajs, gt_traj_masks, instance_inds):
+        """Compute L1 loss for future motion predictions against GT trajectories."""
+        device = active_track_instances.cache_motion_predictions.device
+
+        if instance_inds is None or len(active_track_instances) == 0:
+            zero = active_track_instances.motion_predictions.sum(
+            ) * 0.0 + active_track_instances.fut_logits.sum() * 0.0
+            return {
+                'forecast_loss': zero,
+                'forecast_avg_factor': torch.tensor(1.0, device=device),
+            }
+
+        obj_idx_to_gt = {int(oid): gi for gi, oid in enumerate(
+            instance_inds.cpu().numpy().tolist())}
+
+        active_gt = torch.ones_like(
+            active_track_instances.cache_motion_predictions)
+        active_gt[..., -1] = 0.0
+        active_mask = torch.zeros_like(active_gt)[..., 0]
+
+        for ti, oid in enumerate(active_track_instances.obj_idxes):
+            cpu_id = int(oid.cpu())
+            if cpu_id not in obj_idx_to_gt:
+                continue
+            idx = obj_idx_to_gt[cpu_id]
+            traj = gt_trajs[idx:idx+1, :self.fut_len + 1, :]
+            gt_motion = traj[:, 1:self.fut_len+1] - traj[:, :self.fut_len]
+            active_gt[ti:ti+1] = gt_motion
+            active_mask[ti:ti+1] = (
+                gt_traj_masks[idx:idx+1, 1:self.fut_len+1] *
+                gt_traj_masks[idx:idx+1, :self.fut_len])
+
+        pred = active_track_instances.cache_motion_predictions[..., :2]
+        gt = active_gt[..., :2]
+        m = active_mask.unsqueeze(-1).expand_as(pred)
+        loss = F.l1_loss(pred * m, gt * m, reduction='sum')
+        af = max(m.sum().item(), 1.0)
+
+        return {
+            'forecast_loss': loss / af,
+            'forecast_avg_factor': torch.tensor(af, device=device),
+        }
+
     def update_reference_points(self, track_instances, time_delta=None, use_prediction=True, tracking=False):
         """Update the reference points according to the motion prediction/velocities
         """
@@ -589,33 +903,8 @@ class CMTCoopTracker(MVXTwoStageDetector):
             track_instances, l2g_r1, l2g_t1, l2g_r2, l2g_t2)
         return track_instances
 
-    @auto_fp16(apply_to=('img'), out_fp32=True)
-    def extract_img_feat(self, img, img_metas):
-        """Extract features of images."""
-        if self.with_img_backbone and img is not None:
-            input_shape = img.shape[-2:]
-            # update real input shape of each single img
-            for img_meta in img_metas:
-                img_meta.update(input_shape=input_shape)
-
-            if img.dim() == 5 and img.size(0) == 1:
-                img.squeeze_(0)
-            elif img.dim() == 5 and img.size(0) > 1:
-                B, N, C, H, W = img.size()
-                img = img.view(B * N, C, H, W)
-            if self.use_grid_mask:
-                img = self.grid_mask(img)
-            img_feats = self.img_backbone(img.float())
-            if isinstance(img_feats, dict):
-                img_feats = list(img_feats.values())
-        else:
-            return None
-        if self.with_img_neck:
-            img_feats = self.img_neck(img_feats)
-        return img_feats
-
     @force_fp32(apply_to=('pts', 'img_feats'))
-    def extract_pts_feat(self, pts, img_feats, img_metas):
+    def extract_pts_feat(self, pts, img_feats=None, img_metas=None):
         """Extract features of points."""
         if not self.with_pts_bbox:
             return None
@@ -645,6 +934,12 @@ class CMTCoopTracker(MVXTwoStageDetector):
         """
         voxels, coors, num_points = [], [], []
         for res in points:
+            # In det mode with temporal-style dataset output, each sample can be
+            # wrapped as a single-element list/tuple: [points_tensor].
+            if isinstance(res, (list, tuple)):
+                if len(res) == 0:
+                    continue
+                res = res[0]
             res_voxels, res_coors, res_num_points = self.pts_voxel_layer(res)
             voxels.append(res_voxels)
             coors.append(res_coors)
@@ -749,6 +1044,18 @@ class CMTCoopTracker(MVXTwoStageDetector):
             gt_bboxes_3d, gt_labels_3d, head_outs)
         det_losses = {f"det_{k}": v for k, v in det_losses.items()}
 
+        # Keep a stable loss-key set across GPUs for DDP logging/reduction.
+        # dn_aux replaced by per-layer d0.dn_loss_cls, d1.dn_loss_cls, etc. in CmtLidarHead
+        det_expected_keys = [
+            'det_loss_cls', 'det_loss_bbox', 'det_loss_iou',
+            'det_aux_loss_cls', 'det_aux_loss_bbox', 'det_aux_loss_iou',
+            'det_dn_loss_cls', 'det_dn_loss_bbox',
+        ]
+        det_zero = output_classes.new_tensor(0.0)
+        for key in det_expected_keys:
+            if key not in det_losses:
+                det_losses[key] = det_zero.clone()
+
         for j in range(bs):
             cur_loss = dict()
             cur_track_instances = track_instances[j]
@@ -782,11 +1089,9 @@ class CMTCoopTracker(MVXTwoStageDetector):
             # The base detection losses (including intermediate layers, dn_loss, and the final layer
             # for both track and new queries) are now computed outside this loop in `det_losses`.
 
-            if not self.is_cooperation:
-                # Update tracks
-                pass
-
+            # ---- Cooperative mode: build and fuse infrastructure queries ----
             inf_instances = None
+            asso_label = None
             if self.is_cooperation:
                 inf_dcit = {
                     'query_feats': kwargs['query_feats'][j][0],
@@ -799,25 +1104,81 @@ class CMTCoopTracker(MVXTwoStageDetector):
                     inf_dcit = self.crossview_alignment(
                         inf_dcit, veh2inf_rt[j])
                     inf_instances = self._init_inf_tracks(inf_dcit)
-                if self.STReasoner.learn_match:
-                    mask = cur_track_instances.cache_scores > self.STReasoner.veh_thre
-                    veh_boxes = cur_track_instances[mask].cache_bboxes.clone()
-                    inf_boxes = inf_instances.cache_bboxes.clone()
-                    asso_label = self.STReasoner._gen_asso_label(
-                        gt_bboxes_3d[j], inf_boxes, veh_boxes, img_metas[j]['sample_idx'])
+                    if self.STReasoner.learn_match:
+                        mask = cur_track_instances.cache_scores > self.STReasoner.veh_thre
+                        veh_boxes = cur_track_instances[mask].cache_bboxes.clone(
+                        )
+                        inf_boxes = inf_instances.cache_bboxes.clone()
+                        asso_label = self.STReasoner._gen_asso_label(
+                            gt_bboxes_3d[j], inf_boxes, veh_boxes,
+                            img_metas[j]['sample_idx'])
 
-            # 3. Spatial-temporal reasoning
+            # ---- Spatial-temporal reasoning (history + aggregation + future) ----
             cur_track_instances, affinity = self.STReasoner(
                 cur_track_instances, inf_instances)
 
+            # ---- Cooperative fusion loss ----
             if self.is_cooperation:
-                pass  # Cooperative loss logic to be added if needed
+                _dev = cur_track_instances.cache_logits.device
+                fused_loss = self._compute_refinement_loss(
+                    cur_track_instances,
+                    gt_bboxes_3d[j], gt_labels_3d[j],
+                    gt_inds=gt_inds[j] if gt_inds is not None and len(
+                        gt_inds) > j else None,
+                    prefix='fused_')
+                cur_loss.update(fused_loss)
 
+                if self.STReasoner.learn_match:
+                    if (affinity is not None and asso_label is not None
+                            and affinity.numel() > 0
+                            and not torch.all(asso_label.eq(0))):
+                        loss_focal = self.asso_loss_focal['loss_weight'] * sigmoid_focal_loss(
+                            affinity.view(-1, 1),
+                            asso_label.view(-1, 1).float(),
+                            alpha=self.asso_loss_focal['alpha'],
+                            gamma=self.asso_loss_focal['gamma'],
+                            reduction='mean')
+                    else:
+                        if affinity is not None and affinity.numel() > 0:
+                            loss_focal = affinity.sum() * 0.0
+                        else:
+                            loss_focal = cur_track_instances.cache_logits.sum() * 0.0
+                    cur_loss.update({
+                        'asso_loss': loss_focal,
+                        'asso_avg_factor': torch.tensor(1.0, device=_dev),
+                    })
+
+            # ---- History reasoning loss (mem bank) ----
             if self.STReasoner.history_reasoning:
-                pass  # Mem bank loss to be added if needed
+                hist_loss = self._compute_refinement_loss(
+                    cur_track_instances,
+                    gt_bboxes_3d[j], gt_labels_3d[j],
+                    gt_inds=gt_inds[j] if gt_inds is not None and len(
+                        gt_inds) > j else None,
+                    prefix='hist_')
+                cur_loss.update(hist_loss)
 
+            # ---- Future prediction loss ----
             if self.STReasoner.future_reasoning:
-                pass  # Forecasting loss to be added if needed
+                _dev = cur_track_instances.cache_logits.device
+                active_mask_fut = (cur_track_instances.obj_idxes >= 0)
+                if (gt_forecasting_locs is not None
+                        and gt_forecasting_masks is not None
+                        and gt_inds is not None):
+                    fut_inds = gt_inds[j][0] if isinstance(
+                        gt_inds[j], (list, tuple)) else gt_inds[j]
+                    loss_fut = self.forward_loss_prediction(
+                        cur_track_instances[active_mask_fut],
+                        gt_forecasting_locs[j][0],
+                        gt_forecasting_masks[j][0],
+                        fut_inds)
+                    cur_loss.update(loss_fut)
+                else:
+                    cur_loss.update({
+                        'forecast_loss': torch.tensor(
+                            0.0, device=_dev, requires_grad=True),
+                        'forecast_avg_factor': torch.tensor(1.0, device=_dev),
+                    })
 
             cur_track_instances = self.frame_summarization(
                 cur_track_instances, tracking=False)
@@ -850,6 +1211,15 @@ class CMTCoopTracker(MVXTwoStageDetector):
             af_key = key.replace('loss', 'avg_factor')
             avg_factor = avg_factors[af_key]
             losses[key] = value / avg_factor
+
+        expected_extra_keys = [
+            'hist_loss_cls', 'hist_loss_bbox',
+            'fused_loss_cls', 'fused_loss_bbox', 'asso_loss',
+            'forecast_loss'
+        ]
+        for key in expected_extra_keys:
+            if key not in losses:
+                losses[key] = det_zero.clone()
 
         losses.update(det_losses)
         return out, losses
@@ -898,9 +1268,10 @@ class CMTCoopTracker(MVXTwoStageDetector):
     def select_active_track_query(self, track_instances, active_index, img_metas, with_mask=True):
         result_dict = self._track_instances2results(
             track_instances[active_index], img_metas, with_mask=with_mask)
-        # result_dict["track_query_embeddings"] = track_instances.output_embedding[active_index][result_dict['bbox_index']][result_dict['mask']]
-        result_dict["track_query_matched_idxes"] = track_instances.matched_gt_idxes[
-            active_index][result_dict['bbox_index']][result_dict['mask']]
+        # result_dict["track_query_embeddings"] = track_instances.output_embedding[active_index][result_dict['bbox_index']]
+        if hasattr(track_instances, "matched_gt_idxes"):
+            result_dict["track_query_matched_idxes"] = track_instances.matched_gt_idxes[
+                active_index][result_dict['bbox_index']]
         return result_dict
 
     def _forward_single_frame_inference(
@@ -921,9 +1292,16 @@ class CMTCoopTracker(MVXTwoStageDetector):
         if prev_active_track_instances is None:
             track_instances = self._generate_empty_tracks()
         else:
-            if l2g_r1[0] is not None and l2g_t1[0] is not None:
+            if l2g_r1 is not None and l2g_t1 is not None:
+                # inference passes single tensor, no list indexing needed here since it's already unwrapped in simple_test_track or forward_test
+                # However, to support both list format and tensor format, check type:
+                _r1 = l2g_r1[0] if isinstance(l2g_r1, list) else l2g_r1
+                _t1 = l2g_t1[0] if isinstance(l2g_t1, list) else l2g_t1
+                _r2 = l2g_r2[0] if isinstance(l2g_r2, list) else l2g_r2
+                _t2 = l2g_t2[0] if isinstance(l2g_t2, list) else l2g_t2
+
                 prev_active_track_instances.ref_pts = self._ego_motion_compensation(
-                    prev_active_track_instances.ref_pts.clone(), l2g_r1[0], l2g_t1[0], l2g_r2[0], l2g_t2[0])
+                    prev_active_track_instances.ref_pts.clone(), _r1, _t1, _r2, _t2)
 
             prev_active_track_instances = self.STReasoner.sync_pos_embedding(
                 prev_active_track_instances, self.query_embedding)
@@ -939,7 +1317,8 @@ class CMTCoopTracker(MVXTwoStageDetector):
                 [empty_track_instances, prev_active_track_instances])
             track_instances = out_track_instances
 
-        pts_feats = self.extract_pts_feat(points)
+        pts_feats = self.extract_pts_feat(
+            points, img_feats=None, img_metas=img_metas)
         head_outs = self.pts_bbox_head(
             pts_feats, img_metas=[img_metas[0]], track_instances=track_instances)
 
@@ -967,14 +1346,17 @@ class CMTCoopTracker(MVXTwoStageDetector):
         inf_instances = None
         if self.is_cooperation:
             inf_dcit = {
-                'query_feats': kwargs['query_feats'][0][0],
-                'query_embeds': kwargs['query_embeds'][0][0],
-                'cache_motion_feats': kwargs['cache_motion_feats'][0][0] if 'cache_motion_feats' in kwargs else None,
-                'ref_pts': kwargs['ref_pts'][0][0],
-                'pred_boxes': kwargs['pred_boxes'][0][0],
+                'query_feats': kwargs['query_feats'][0][0] if isinstance(kwargs['query_feats'], list) else kwargs['query_feats'][0],
+                'query_embeds': kwargs['query_embeds'][0][0] if isinstance(kwargs['query_embeds'], list) else kwargs['query_embeds'][0],
+                'cache_motion_feats': (kwargs['cache_motion_feats'][0][0] if isinstance(kwargs['cache_motion_feats'], list) else kwargs['cache_motion_feats'][0]) if 'cache_motion_feats' in kwargs else None,
+                'ref_pts': kwargs['ref_pts'][0][0] if isinstance(kwargs['ref_pts'], list) else kwargs['ref_pts'][0],
+                'pred_boxes': kwargs['pred_boxes'][0][0] if isinstance(kwargs['pred_boxes'], list) else kwargs['pred_boxes'][0],
             }
             if inf_dcit['query_feats'].shape[0] > 0:
-                inf_dcit = self.crossview_alignment(inf_dcit, veh2inf_rt[0])
+                # also unwrap veh2inf_rt safely
+                _veh2inf = veh2inf_rt[0] if isinstance(
+                    veh2inf_rt, list) else veh2inf_rt
+                inf_dcit = self.crossview_alignment(inf_dcit, _veh2inf)
                 inf_instances = self._init_inf_tracks(inf_dcit)
 
         # Spatial-temporal Reasoning
@@ -991,13 +1373,31 @@ class CMTCoopTracker(MVXTwoStageDetector):
         else:
             out['all_motion_forecasting'] = None
 
-        active_mask = (track_instances.scores > self.runtime_tracker.threshold)
+        # Separate "existing track keep" and "new track birth":
+        # - Existing IDs use a lower keep threshold to improve continuity.
+        # - New IDs use a stricter birth threshold to suppress FP explosion.
+        scores = track_instances.scores
+        has_id_mask = (track_instances.obj_idxes >= 0)
+        keep_mask = has_id_mask & (
+            scores >= self.runtime_tracker.output_threshold)
+        if self.class_birth_thresholds is not None:
+            cls_ids = track_instances.pred_logits.sigmoid().max(dim=-1).indices
+            cls_ids = cls_ids.clamp(
+                min=0, max=self.class_birth_thresholds.numel() - 1)
+            per_query_birth_thresh = self.class_birth_thresholds.to(
+                device=scores.device, dtype=scores.dtype)[cls_ids]
+            birth_mask = (~has_id_mask) & (scores >= per_query_birth_thresh)
+        else:
+            birth_mask = (~has_id_mask) & (
+                scores >= self.runtime_tracker.threshold)
+        active_mask = keep_mask | birth_mask
+
         track_instances = self.runtime_tracker.get_assign_ids(
-            track_instances, active_mask)
+            track_instances, birth_mask)
 
         out['track_instances'] = track_instances
-        active_index = (track_instances.scores >=
-                        self.runtime_tracker.output_threshold)
+        active_index = ((track_instances.scores >= self.runtime_tracker.output_threshold)
+                        & (track_instances.obj_idxes >= 0))
         out.update(self.select_active_track_query(
             track_instances, active_index, img_metas))
 
@@ -1041,13 +1441,19 @@ class CMTCoopTracker(MVXTwoStageDetector):
             else:
                 time_delta[i] = timestamp[i][0] - \
                     self.train_prev_infos['prev_timestamp'][i]
-                assert time_delta[i] > 0
-                l2g_r1[i] = self.train_prev_infos['l2g_r_mat'][i]
-                l2g_t1[i] = self.train_prev_infos['l2g_t'][i]
-                l2g_r2[i] = l2g_r_mat[i][0]
-                l2g_t2[i] = l2g_t[i][0]
-                img_metas[i][0]['can_bus'][:3] -= self.train_prev_infos['prev_pos'][i]
-                img_metas[i][0]['can_bus'][-1] -= self.train_prev_infos['prev_angle'][i]
+                if time_delta[i] <= 0:
+                    # Same/dropped frame or timestamp order issue: treat as new sequence
+                    self.train_prev_infos['track_instances'][i] = None
+                    time_delta[i], l2g_r1[i], l2g_t1[i], l2g_r2[i], l2g_t2[i] = None, None, None, None, None
+                    img_metas[i][0]['can_bus'][:3] = 0
+                    img_metas[i][0]['can_bus'][-1] = 0
+                else:
+                    l2g_r1[i] = self.train_prev_infos['l2g_r_mat'][i]
+                    l2g_t1[i] = self.train_prev_infos['l2g_t'][i]
+                    l2g_r2[i] = l2g_r_mat[i][0]
+                    l2g_t2[i] = l2g_t[i][0]
+                    img_metas[i][0]['can_bus'][:3] -= self.train_prev_infos['prev_pos'][i]
+                    img_metas[i][0]['can_bus'][-1] -= self.train_prev_infos['prev_angle'][i]
 
             self.train_prev_infos['scene_token'][i] = img_metas[i][0]['scene_token']
             self.train_prev_infos['prev_timestamp'][i] = timestamp[i][0]
@@ -1088,6 +1494,59 @@ class CMTCoopTracker(MVXTwoStageDetector):
             )
         return losses
 
+    def _points_sample_num(self, pt):
+        """Get point count for a single sample; handle list/tuple wrap."""
+        if isinstance(pt, (list, tuple)):
+            pt = pt[0] if len(pt) > 0 else None
+        if pt is None:
+            return 0
+        return pt.shape[0] if hasattr(pt, 'shape') else 0
+
+    def _empty_det_results(self, img_metas):
+        """Return empty detection results for all samples in img_metas."""
+        results = []
+        for meta in img_metas:
+            box_cls = meta['box_type_3d']
+            empty_boxes = box_cls(torch.zeros(0, 9), 9)
+            empty_scores = torch.zeros(0)
+            empty_labels = torch.zeros(0, dtype=torch.long)
+            det_dict = bbox3d2result(empty_boxes, empty_scores, empty_labels)
+            det_dict['boxes_3d_det'] = det_dict['boxes_3d']
+            det_dict['scores_3d_det'] = det_dict['scores_3d']
+            det_dict['labels_3d_det'] = det_dict['labels_3d']
+            results.append(det_dict)
+        return results
+
+    def simple_test_det(self, points, img_metas):
+        """Pure detection path, mirroring cmt.py: extract_pts_feat -> pts_bbox_head -> get_bboxes.
+        No track_instances, STReasoner, runtime_tracker, or any track state.
+        """
+        # Early exit for empty point clouds (spconv fails on N=0)
+        if all(self._points_sample_num(pt) == 0 for pt in points):
+            return self._empty_det_results(img_metas)
+        pts_feats = self.extract_pts_feat(
+            points, img_feats=None, img_metas=img_metas)
+        if pts_feats is None:
+            pts_feats = [None]
+        img_feats = [None]
+        bbox_pts = self.simple_test_pts_det(pts_feats, img_feats, img_metas)
+        return bbox_pts
+
+    @force_fp32(apply_to=('x', 'x_img'))
+    def simple_test_pts_det(self, x, x_img, img_metas, rescale=False):
+        """Pure det pts branch, mirroring cmt.CmtDetector.simple_test_pts."""
+        outs = self.pts_bbox_head(x, x_img, img_metas)
+        bbox_list = self.pts_bbox_head.get_bboxes(
+            outs, img_metas, rescale=rescale)
+        results = []
+        for bboxes, scores, labels in bbox_list:
+            det_dict = bbox3d2result(bboxes, scores, labels)
+            det_dict['boxes_3d_det'] = det_dict['boxes_3d']
+            det_dict['scores_3d_det'] = det_dict['scores_3d']
+            det_dict['labels_3d_det'] = det_dict['labels_3d']
+            results.append(det_dict)
+        return results
+
     def simple_test_track(
         self,
         points=None,
@@ -1098,7 +1557,6 @@ class CMTCoopTracker(MVXTwoStageDetector):
         veh2inf_rt=None,
         **kwargs,
     ):
-        bs = points.size(0)
         tmp_pos = copy.deepcopy(img_metas[0]['can_bus'][:3])
         tmp_angle = copy.deepcopy(img_metas[0]['can_bus'][-1])
         if (
@@ -1121,6 +1579,11 @@ class CMTCoopTracker(MVXTwoStageDetector):
             l2g_t1 = self.l2g_t
             l2g_r2 = l2g_r_mat
             l2g_t2 = l2g_t
+
+            # test inference expects list of size 1 for time_delta and list of size 1 for extrinsics
+            # to match train BS format if needed by _ego_motion_compensation, or we just pass the raw tensors
+            # and let _forward_single_frame_inference handle it.
+
             img_metas[0]['can_bus'][:3] -= self.prev_pos
             img_metas[0]['can_bus'][-1] -= self.prev_angle
 

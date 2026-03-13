@@ -8,4 +8,5 @@ from .spatial_temporal_reason import *
 # from .temporal_self_attention import *
 from .latent_transformation import *
 from .pf_utils import *
+from .pf_temporal_transformer import *
 # from .motion_extractor import *

@@ -124,16 +124,33 @@ class HungarianAssigner3D(BaseAssigner):
         # classification and bboxcost.
         cls_cost = self.cls_cost(cls_pred, gt_labels)
         # regression L1 cost
+        # gt_bboxes: raw (cx,cy,cz,w,l,h,rot,vx,vy), normalized inside assigner
         normalized_gt_bboxes = normalize_bbox(gt_bboxes, self.pc_range)
+        # bbox_pred: head output (cx,cy,cz,log_w,log_l,log_h,sin,cos,vx,vy), NOT denormalized
+        # Reorder pred to match target layout (cx,cy,log_w,log_l,cz,log_h,sin,cos,vx,vy)
+        bbox_pred_aligned = bbox_pred[:, [0, 1, 3, 4, 2, 5, 6, 7]]
 
         if self.code_weights is not None:
-            bbox_pred = bbox_pred * self.code_weights
-            normalized_gt_bboxes = normalized_gt_bboxes * self.code_weights
-        
-        reg_cost = self.reg_cost(bbox_pred[:, :8], normalized_gt_bboxes[:, :8])
-      
-        # weighted sum of above two costs
-        cost = cls_cost + reg_cost
+            cw = self.code_weights[:, :8]  # code_weights for first 8 dims
+            bbox_pred_aligned = bbox_pred_aligned * cw
+            normalized_gt_bboxes = normalized_gt_bboxes[:, :8] * cw
+        else:
+            normalized_gt_bboxes = normalized_gt_bboxes[:, :8]
+
+        reg_cost = self.reg_cost(bbox_pred_aligned, normalized_gt_bboxes)
+
+        # IoU cost (BEV): higher IoU -> lower cost; supports BBoxIoUBEVCost(bbox_pred, gt_bboxes, pc_range)
+        iou_cost_val = 0.0
+        if self.pc_range is not None:
+            try:
+                iou_cost_val = self.iou_cost(bbox_pred, gt_bboxes, self.pc_range)
+            except TypeError:
+                # IoUCost (mmdet) expects different args, skip
+                pass
+        if isinstance(iou_cost_val, torch.Tensor):
+            cost = cls_cost + reg_cost + iou_cost_val
+        else:
+            cost = cls_cost + reg_cost
         
         # 3. do Hungarian matching on CPU using linear_sum_assignment
         cost = cost.detach().cpu()

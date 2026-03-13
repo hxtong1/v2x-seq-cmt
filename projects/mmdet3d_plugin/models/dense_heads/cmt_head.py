@@ -243,6 +243,7 @@ class CmtHead(BaseModule):
                      reduction="mean",
                      loss_weight=0.25,
                  ),
+                 loss_iou=None,
                  loss_heatmap=dict(
                      type="GaussianFocalLoss",
                      reduction="mean"
@@ -250,6 +251,7 @@ class CmtHead(BaseModule):
                  separate_head=dict(
                      type='SeparateMlpHead', init_bias=-2.19, final_kernel=3),
                  init_cfg=None,
+                 ref_point_x_range=None,
                  **kwargs):
         assert init_cfg is None
         super(CmtHead, self).__init__(init_cfg=init_cfg)
@@ -268,9 +270,12 @@ class CmtHead(BaseModule):
         self.bbox_noise_trans = noise_trans
         self.dn_weight = dn_weight
         self.split = split
+        # ref_point_x_range: [low, high] for x (norm) to bias queries to far range (infra)
+        self.ref_point_x_range = ref_point_x_range
 
         self.loss_cls = build_loss(loss_cls)
         self.loss_bbox = build_loss(loss_bbox)
+        self.loss_iou = build_loss(loss_iou) if loss_iou is not None else None
         self.loss_heatmap = build_loss(loss_heatmap)
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.pc_range = self.bbox_coder.pc_range
@@ -318,7 +323,11 @@ class CmtHead(BaseModule):
 
     def init_weights(self):
         super(CmtHead, self).init_weights()
-        nn.init.uniform_(self.reference_points.weight.data, 0, 1)
+        w = self.reference_points.weight.data  # (num_query, 3)
+        nn.init.uniform_(w, 0, 1)
+        if self.ref_point_x_range is not None:
+            low, high = self.ref_point_x_range
+            nn.init.uniform_(w[:, 0], low, high)  # bias x (first dim) to far range
 
     @property
     def coords_bev(self):
@@ -342,14 +351,17 @@ class CmtHead(BaseModule):
             for img_meta in img_metas:
                 gt_bboxes = img_meta.get('gt_bboxes_3d', None)
                 if isinstance(gt_bboxes, list):
-                    gt_bboxes = gt_bboxes[0]  # Take the first item if it's a list (caused by batch dimension changes)
+                    # Take the first item if it's a list (caused by batch dimension changes)
+                    gt_bboxes = gt_bboxes[0]
                 if hasattr(gt_bboxes, '_data'):
                     gt_bboxes = gt_bboxes._data
-                
+
                 if gt_bboxes is not None:
-                    targets.append(torch.cat((gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1))
+                    targets.append(
+                        torch.cat((gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1))
                 else:
-                    targets.append(torch.zeros((0, 9), device=reference_points.device)) # fallback
+                    targets.append(torch.zeros(
+                        (0, 9), device=reference_points.device))  # fallback
 
             labels = []
             for img_meta in img_metas:
@@ -361,9 +373,11 @@ class CmtHead(BaseModule):
                 if gt_labels is not None:
                     labels.append(gt_labels)
                 else:
-                    labels.append(torch.zeros((0,), dtype=torch.long, device=reference_points.device)) # fallback
-            
-            known = [(torch.ones_like(t)).to(reference_points.device) for t in labels]
+                    labels.append(torch.zeros((0,), dtype=torch.long,
+                                  device=reference_points.device))  # fallback
+
+            known = [(torch.ones_like(t)).to(reference_points.device)
+                     for t in labels]
             know_idx = known
             unmask_bbox = unmask_label = torch.cat(known)
             known_num = [t.size(0) for t in targets]
@@ -404,7 +418,8 @@ class CmtHead(BaseModule):
                 mask = torch.norm(rand_prob, 2, 1) > self.split
                 known_labels[mask] = sum(self.num_classes)
 
-            single_pad = int(max(known_num))
+            single_pad = max(1, int(max(known_num))
+                             ) if self.training else int(max(known_num))
             pad_size = int(single_pad * groups)
             padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)
             padded_reference_points = torch.cat(
@@ -539,6 +554,9 @@ class CmtHead(BaseModule):
             return List(dict(head_name: [num_dec x bs x num_query * head_dim]) ) x task_num
         """
         ret_dicts = []
+        conv_dtype = self.shared_conv.conv.weight.dtype
+        if x.dtype != conv_dtype:
+            x = x.to(dtype=conv_dtype)
         x = self.shared_conv(x)
 
         reference_points = self.reference_points.weight
@@ -676,7 +694,8 @@ class CmtHead(BaseModule):
                 task_class.append(gt_labels_3d[m] - flag2)
                 task_gt_index.append(m[0].to(device=device, dtype=torch.long))
                 if gt_inds is not None:
-                    task_obj_id.append(gt_inds[m].to(device=device, dtype=torch.long))
+                    task_obj_id.append(gt_inds[m].to(
+                        device=device, dtype=torch.long))
             task_boxes.append(torch.cat(task_box, dim=0).to(device))
             task_classes.append(torch.cat(task_class).long().to(device))
             task_gt_indices.append(torch.cat(task_gt_index).long().to(device))
@@ -708,7 +727,8 @@ class CmtHead(BaseModule):
         per_query_matches = {}
 
         for task_id, (bbox_pred, logits_pred, gt_bboxes, gt_labels, gt_index_map, obj_id_map) in enumerate(
-            zip(pred_bboxes, pred_logits, task_boxes, task_classes, task_gt_indices, task_obj_ids)
+            zip(pred_bboxes, pred_logits, task_boxes,
+                task_classes, task_gt_indices, task_obj_ids)
         ):
             if bbox_pred.numel() == 0 or logits_pred.numel() == 0 or gt_bboxes.numel() == 0:
                 continue
@@ -732,7 +752,8 @@ class CmtHead(BaseModule):
                     continue
                 per_query_matches[query_idx] = dict(
                     matched_gt_idxes=gt_index_map[local_gt_idx],
-                    obj_idxes=obj_id_map[local_gt_idx] if obj_id_map is not None else gt_index_map.new_tensor(-1),
+                    obj_idxes=obj_id_map[local_gt_idx] if obj_id_map is not None else gt_index_map.new_tensor(
+                        -1),
                     labels=gt_labels[local_gt_idx],
                     track_scores=score,
                     task_id=task_id,
@@ -740,7 +761,8 @@ class CmtHead(BaseModule):
 
         if len(per_query_matches) == 0:
             empty_long = torch.zeros(0, device=device, dtype=torch.long)
-            empty_float = torch.zeros(0, device=device, dtype=pred_bboxes[0].dtype)
+            empty_float = torch.zeros(
+                0, device=device, dtype=pred_bboxes[0].dtype)
             return dict(
                 query_inds=empty_long,
                 matched_gt_idxes=empty_long,
@@ -752,16 +774,19 @@ class CmtHead(BaseModule):
         query_inds = torch.tensor(
             sorted(per_query_matches.keys()), device=device, dtype=torch.long)
         matched_gt_idxes = torch.stack(
-            [per_query_matches[idx]["matched_gt_idxes"] for idx in query_inds.tolist()]
+            [per_query_matches[idx]["matched_gt_idxes"]
+                for idx in query_inds.tolist()]
         ).long()
         obj_idxes = torch.stack(
-            [per_query_matches[idx]["obj_idxes"] for idx in query_inds.tolist()]
+            [per_query_matches[idx]["obj_idxes"]
+                for idx in query_inds.tolist()]
         ).long()
         labels = torch.stack(
             [per_query_matches[idx]["labels"] for idx in query_inds.tolist()]
         ).long()
         track_scores = torch.stack(
-            [per_query_matches[idx]["track_scores"] for idx in query_inds.tolist()]
+            [per_query_matches[idx]["track_scores"]
+                for idx in query_inds.tolist()]
         )
         return dict(
             query_inds=query_inds,
@@ -794,6 +819,15 @@ class CmtHead(BaseModule):
 
         def task_assign(bbox_pred, logits_pred, gt_bboxes, gt_labels, num_classes):
             num_bboxes = bbox_pred.shape[0]
+
+            # Clean up abnormal GT velocity for the assigner so it doesn't break matching
+            if gt_bboxes.size(-1) > 7:
+                vel_norm = torch.norm(gt_bboxes[..., 7:9], dim=-1)
+                abnormal_mask = vel_norm > 30.0
+                if abnormal_mask.any():
+                    gt_bboxes = gt_bboxes.clone()
+                    gt_bboxes[abnormal_mask, 7:9] = 30.0
+
             assign_results = self.assigner.assign(
                 bbox_pred, logits_pred, gt_bboxes, gt_labels)
             sampling_result = self.sampler.sample(
@@ -908,16 +942,41 @@ class CmtHead(BaseModule):
         bbox_weights = bbox_weights * \
             bbox_weights.new_tensor(self.train_cfg.code_weights)[None, :]
 
+        # mask out abnormal velocity
+        if bbox_targets.size(-1) > 7:
+            vel_norm = torch.norm(bbox_targets[..., 7:9], dim=-1)
+            abnormal_vel_mask = vel_norm > 30.0  # mask if speed > 30m/s
+            bbox_weights[abnormal_vel_mask, 8:10] = 0.0
+
+        # P0: reorder pred to match target layout
+        pred_for_loss = pred_bboxes_flatten[isnotnan, :10][:, [
+            0, 1, 3, 4, 2, 5, 6, 7, 8, 9]]
+        target_for_loss = normalized_bbox_targets[isnotnan, :10].clone()
+
+        # Center in physical space (no P1 norm) so 1m error → strong gradient for ATE
+        # P1 reverted: center [0,1] made gradient too weak, ATE stayed high
+
         loss_bbox = self.loss_bbox(
-            pred_bboxes_flatten[isnotnan, :10],
-            normalized_bbox_targets[isnotnan, :10],
+            pred_for_loss,
+            target_for_loss,
             bbox_weights[isnotnan, :10],
             avg_factor=num_total_pos
         )
 
+        loss_iou = pred_for_loss.sum() * 0.0
+        if self.loss_iou is not None and num_total_pos > 0 and isnotnan.any():
+            loss_iou = self.loss_iou(
+                pred_for_loss,
+                target_for_loss,
+                weight=None,
+                avg_factor=num_total_pos,
+                pc_range=list(self.pc_range),
+            )
+
         loss_cls = torch.nan_to_num(loss_cls)
         loss_bbox = torch.nan_to_num(loss_bbox)
-        return loss_cls, loss_bbox
+        loss_iou = torch.nan_to_num(loss_iou)
+        return loss_cls, loss_bbox, loss_iou
 
     def loss_single(self,
                     pred_bboxes,
@@ -947,7 +1006,7 @@ class CmtHead(BaseModule):
         )
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
-        loss_cls_tasks, loss_bbox_tasks = multi_apply(
+        loss_cls_tasks, loss_bbox_tasks, loss_iou_tasks = multi_apply(
             self._loss_single_task,
             pred_bboxes,
             pred_logits,
@@ -958,8 +1017,9 @@ class CmtHead(BaseModule):
             num_total_pos,
             num_total_neg
         )
-
-        return sum(loss_cls_tasks), sum(loss_bbox_tasks)
+        num_pos_batch = sum(num_total_pos)
+        loss_iou = sum(loss_iou_tasks) if loss_iou_tasks else pred_bboxes[0].sum() * 0.0
+        return sum(loss_cls_tasks), sum(loss_bbox_tasks), loss_iou, num_pos_batch
 
     def _dn_loss_single_task(self,
                              pred_bboxes,
@@ -975,6 +1035,9 @@ class CmtHead(BaseModule):
         pred_logits = pred_logits[(bid, map_known_indice)]
         pred_bboxes = pred_bboxes[(bid, map_known_indice)]
         num_tgt = known_indice.numel()
+
+        if num_tgt == 0:
+            return pred_logits.sum() * 0.0, pred_bboxes.sum() * 0.0
 
         # filter task bbox
         task_mask = known_labels_raw != pred_logits.shape[-1]
@@ -998,7 +1061,9 @@ class CmtHead(BaseModule):
         # Compute the average number of gt boxes accross all gpus, for
         # normalization purposes
         num_tgt = loss_cls.new_tensor([num_tgt])
-        num_tgt = torch.clamp(reduce_mean(num_tgt), min=1).item()
+        # To prevent distributed desync when has_dn is True on some GPUs but False on others,
+        # we do not use reduce_mean here.
+        num_tgt = torch.clamp(num_tgt, min=1).item()
 
         # regression L1 loss
         normalized_bbox_targets = normalize_bbox(known_bboxs, self.pc_range)
@@ -1008,7 +1073,7 @@ class CmtHead(BaseModule):
             bbox_weights.new_tensor(self.train_cfg.code_weights)[None, :]
         # bbox_weights[:, 6:8] = 0
         loss_bbox = self.loss_bbox(
-            pred_bboxes[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_tgt)
+            pred_bboxes, normalized_bbox_targets, bbox_weights[isnotnan, :10], avg_factor=num_tgt)
 
         loss_cls = torch.nan_to_num(loss_cls)
         loss_bbox = torch.nan_to_num(loss_bbox)
@@ -1032,7 +1097,7 @@ class CmtHead(BaseModule):
             dn_mask_dict = [dn_mask_dict] * len(pred_bboxes)
         elif len(dn_mask_dict) == 1 and len(pred_bboxes) > 1:
             dn_mask_dict = dn_mask_dict * len(pred_bboxes)
-            
+
         loss_cls_tasks, loss_bbox_tasks = multi_apply(
             self._dn_loss_single_task, pred_bboxes, pred_logits, dn_mask_dict
         )
@@ -1078,7 +1143,7 @@ class CmtHead(BaseModule):
         all_pred_bboxes = [all_pred_bboxes[idx] for idx in range(num_decoder)]
         all_pred_logits = [all_pred_logits[idx] for idx in range(num_decoder)]
 
-        loss_cls, loss_bbox = multi_apply(
+        loss_cls, loss_bbox, loss_iou, num_pos_list = multi_apply(
             self.loss_single, all_pred_bboxes, all_pred_logits,
             [gt_bboxes_3d for _ in range(num_decoder)],
             [gt_labels_3d for _ in range(num_decoder)],
@@ -1087,15 +1152,23 @@ class CmtHead(BaseModule):
         loss_dict = dict()
         loss_dict['loss_cls'] = loss_cls[-1]
         loss_dict['loss_bbox'] = loss_bbox[-1]
+        loss_dict['loss_iou'] = loss_iou[-1]
+        # num_pos: Hungarian-matched positives per batch (last decoder), for IoU3D feasibility check
+        loss_dict['num_pos'] = loss_cls[-1].new_tensor(
+            float(num_pos_list[-1]), dtype=torch.float32)
 
         aux_loss_cls = loss_cls[-1] * 0.0
         aux_loss_bbox = loss_bbox[-1] * 0.0
-        for loss_cls_i, loss_bbox_i in zip(loss_cls[:-1],
-                                           loss_bbox[:-1]):
+        aux_loss_iou = loss_iou[-1] * 0.0
+        for loss_cls_i, loss_bbox_i, loss_iou_i in zip(loss_cls[:-1],
+                                                       loss_bbox[:-1],
+                                                       loss_iou[:-1]):
             aux_loss_cls = aux_loss_cls + loss_cls_i
             aux_loss_bbox = aux_loss_bbox + loss_bbox_i
+            aux_loss_iou = aux_loss_iou + loss_iou_i
         loss_dict['aux_loss_cls'] = aux_loss_cls
         loss_dict['aux_loss_bbox'] = aux_loss_bbox
+        loss_dict['aux_loss_iou'] = aux_loss_iou
 
         dn_pred_bboxes, dn_pred_logits = collections.defaultdict(
             list), collections.defaultdict(list)
@@ -1115,10 +1188,12 @@ class CmtHead(BaseModule):
                     dn_pred_logits[dec_id].append(
                         preds_dict[0]['dn_cls_logits'][dec_id])
                     dn_mask_dicts[dec_id].append(preds_dict[0]['dn_mask_dict'])
-        
+
         if has_dn:
-            dn_pred_bboxes = [dn_pred_bboxes[idx] for idx in range(num_decoder)]
-            dn_pred_logits = [dn_pred_logits[idx] for idx in range(num_decoder)]
+            dn_pred_bboxes = [dn_pred_bboxes[idx]
+                              for idx in range(num_decoder)]
+            dn_pred_logits = [dn_pred_logits[idx]
+                              for idx in range(num_decoder)]
             dn_mask_dicts = [dn_mask_dicts[idx] for idx in range(num_decoder)]
             dn_loss_cls, dn_loss_bbox = multi_apply(
                 self.dn_loss_single, dn_pred_bboxes, dn_pred_logits, dn_mask_dicts
@@ -1126,22 +1201,19 @@ class CmtHead(BaseModule):
 
             loss_dict['dn_loss_cls'] = dn_loss_cls[-1]
             loss_dict['dn_loss_bbox'] = dn_loss_bbox[-1]
-            
-            dn_aux_loss_cls = dn_loss_cls[-1] * 0.0
-            dn_aux_loss_bbox = dn_loss_bbox[-1] * 0.0
-            for loss_cls_i, loss_bbox_i in zip(dn_loss_cls[:-1],
-                                            dn_loss_bbox[:-1]):
-                dn_aux_loss_cls = dn_aux_loss_cls + loss_cls_i
-                dn_aux_loss_bbox = dn_aux_loss_bbox + loss_bbox_i
-            loss_dict['dn_aux_loss_cls'] = dn_aux_loss_cls
-            loss_dict['dn_aux_loss_bbox'] = dn_aux_loss_bbox
+
+            # Per-layer dn_loss (same total as dn_aux; no double-count)
+            for num_dec_layer, (loss_cls_i, loss_bbox_i) in enumerate(
+                    zip(dn_loss_cls[:-1], dn_loss_bbox[:-1])):
+                loss_dict[f'd{num_dec_layer}.dn_loss_cls'] = loss_cls_i
+                loss_dict[f'd{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i
         else:
             dummy_loss = loss_dict['loss_cls'] * 0.0
             loss_dict['dn_loss_cls'] = dummy_loss
             loss_dict['dn_loss_bbox'] = dummy_loss
             loss_dict['dn_aux_loss_cls'] = dummy_loss
             loss_dict['dn_aux_loss_bbox'] = dummy_loss
-                
+
         return loss_dict
 
     @force_fp32(apply_to=('preds_dicts'))
@@ -1274,6 +1346,9 @@ class CmtLidarHead(CmtHead):
         assert x_img is None
 
         ret_dicts = []
+        conv_dtype = self.shared_conv.conv.weight.dtype
+        if x.dtype != conv_dtype:
+            x = x.to(dtype=conv_dtype)
         x = self.shared_conv(x)
 
         reference_points = self.reference_points.weight
@@ -1288,15 +1363,18 @@ class CmtLidarHead(CmtHead):
 
         if track_instances is not None and len(track_instances) > 0:
             if isinstance(track_instances, list):
-                ref_pts_track_bs = torch.stack([inst.ref_pts for inst in track_instances], dim=0)
-                query_embeds_track_bs = torch.stack([inst.query_embeds for inst in track_instances], dim=0)
+                ref_pts_track_bs = torch.stack(
+                    [inst.ref_pts for inst in track_instances], dim=0)
+                query_embeds_track_bs = torch.stack(
+                    [inst.query_embeds for inst in track_instances], dim=0)
                 pad_size = 0
             else:
                 ref_pts_track = track_instances.ref_pts
                 query_embeds_track = track_instances.query_embeds
                 bs = x.shape[0]
                 ref_pts_track_bs = ref_pts_track.unsqueeze(0).repeat(bs, 1, 1)
-                query_embeds_track_bs = query_embeds_track.unsqueeze(0).repeat(bs, 1, 1)
+                query_embeds_track_bs = query_embeds_track.unsqueeze(
+                    0).repeat(bs, 1, 1)
 
             if mask_dict and mask_dict['pad_size'] > 0:
                 pad_size = mask_dict['pad_size']

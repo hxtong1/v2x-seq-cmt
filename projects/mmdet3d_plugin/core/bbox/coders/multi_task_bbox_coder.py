@@ -66,6 +66,8 @@ class MultiTaskBBoxCoder(BaseBBoxCoder):
 
         bbox_preds = bbox_preds[task_index * num_query + bbox_index]
 
+        # Reorder pred (cx,cy,cz,log_w,log_l,log_h,sin,cos,vx,vy) to target layout for denormalize
+        bbox_preds = bbox_preds[:, [0, 1, 3, 4, 2, 5, 6, 7, 8, 9]]
         final_box_preds = denormalize_bbox(bbox_preds, self.pc_range)   
         final_scores = scores 
         final_preds = labels 

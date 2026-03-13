@@ -1357,3 +1357,84 @@ class CustomObjectNameFilter(ObjectNameFilter):
         # results['ann_tokens'] = results['ann_tokens'][gt_bboxes_mask]
 
         return results
+
+import hashlib
+from mmdet3d.datasets.pipelines.transforms_3d import GlobalRotScaleTrans
+
+@PIPELINES.register_module()
+class SeqGlobalRotScaleTrans(GlobalRotScaleTrans):
+    def __init__(self,
+                 rot_range=[-0.78539816, 0.78539816],
+                 scale_ratio_range=[0.95, 1.05],
+                 translation_std=[0, 0, 0],
+                 shift_height=False):
+        super().__init__(rot_range, scale_ratio_range, translation_std, shift_height)
+        
+    def _get_seq_seed(self, input_dict):
+        # We use scene_token to generate a deterministic seed for the entire sequence.
+        # This ensures that frames in the same sequence get the EXACT same augmentation.
+        scene_token = input_dict.get('scene_token', 'default_scene')
+        # Generate a seed strictly from the scene_token. 
+        # This ensures consistent augmentation for the same sequence, 
+        # avoiding the problem where ego-motion is invalidated by different augmentations
+        # on different frames.
+        seed_str = f"{scene_token}"
+        seed = int(hashlib.md5(seed_str.encode()).hexdigest(), 16) % (2**32)
+        return seed
+
+    def __call__(self, input_dict):
+        """Private function to rotate, scale and translate bounding boxes and
+        points consistently across a sequence."""
+        if 'transformation_3d_flow' not in input_dict:
+            input_dict['transformation_3d_flow'] = []
+
+        seed = self._get_seq_seed(input_dict)
+        rng = np.random.RandomState(seed)
+
+        # 1. Rotation
+        rotation = self.rot_range
+        noise_rotation = rng.uniform(rotation[0], rotation[1])
+
+        if len(input_dict['bbox3d_fields']) == 0:
+            rot_mat_T = input_dict['points'].rotate(noise_rotation)
+            input_dict['pcd_rotation'] = rot_mat_T
+            input_dict['pcd_rotation_angle'] = noise_rotation
+        else:
+            for key in input_dict['bbox3d_fields']:
+                if len(input_dict[key].tensor) != 0:
+                    points, rot_mat_T = input_dict[key].rotate(
+                        noise_rotation, input_dict['points'])
+                    input_dict['points'] = points
+                    input_dict['pcd_rotation'] = rot_mat_T
+                    input_dict['pcd_rotation_angle'] = noise_rotation
+
+        # 2. Scaling
+        if 'pcd_scale_factor' not in input_dict:
+            scale_factor = rng.uniform(self.scale_ratio_range[0],
+                                       self.scale_ratio_range[1])
+            input_dict['pcd_scale_factor'] = scale_factor
+            
+        scale = input_dict['pcd_scale_factor']
+        points = input_dict['points']
+        points.scale(scale)
+        if self.shift_height:
+            assert 'height' in points.attribute_dims.keys(), \
+                'setting shift_height=True but points have no height attribute'
+            points.tensor[:, points.attribute_dims['height']] *= scale
+        input_dict['points'] = points
+
+        for key in input_dict['bbox3d_fields']:
+            input_dict[key].scale(scale)
+
+        # 3. Translation
+        translation_std = np.array(self.translation_std, dtype=np.float32)
+        trans_factor = rng.normal(scale=translation_std, size=3).T
+
+        input_dict['points'].translate(trans_factor)
+        input_dict['pcd_trans'] = trans_factor
+        for key in input_dict['bbox3d_fields']:
+            input_dict[key].translate(trans_factor)
+
+        input_dict['transformation_3d_flow'].extend(['R', 'S', 'T'])
+        return input_dict
+

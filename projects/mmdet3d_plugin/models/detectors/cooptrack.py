@@ -1078,9 +1078,10 @@ class CoopTrack(MVXTwoStageDetector):
     def select_active_track_query(self, track_instances, active_index, img_metas, with_mask=True):
         result_dict = self._track_instances2results(
             track_instances[active_index], img_metas, with_mask=with_mask)
-        # result_dict["track_query_embeddings"] = track_instances.output_embedding[active_index][result_dict['bbox_index']][result_dict['mask']]
-        result_dict["track_query_matched_idxes"] = track_instances.matched_gt_idxes[
-            active_index][result_dict['bbox_index']][result_dict['mask']]
+        # result_dict["track_query_embeddings"] = track_instances.output_embedding[active_index][result_dict['bbox_index']]
+        if hasattr(track_instances, "matched_gt_idxes"):
+            result_dict["track_query_matched_idxes"] = track_instances.matched_gt_idxes[
+                active_index][result_dict['bbox_index']]
         return result_dict
 
     def forward_track_stream_train(self,

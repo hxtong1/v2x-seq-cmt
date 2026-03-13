@@ -6,7 +6,7 @@ from mmdet.apis import set_random_seed
 from mmdet3d.utils import collect_env, get_root_logger
 from mmdet3d.models import build_model
 from mmdet3d.datasets import build_dataset
-from mmdet3d.apis import init_random_seed, train_model
+from mmdet3d.apis import init_random_seed
 from mmdet3d import __version__ as mmdet3d_version
 from mmdet import __version__ as mmdet_version
 from mmcv.runner import get_dist_info, init_dist
@@ -20,7 +20,8 @@ import time
 import warnings
 from os import path as osp
 
-warnings.filterwarnings('ignore', message='.*Non-finite norm encountered in torch.nn.utils.clip_grad_norm_.*')
+warnings.filterwarnings(
+    'ignore', message='.*Non-finite norm encountered in torch.nn.utils.clip_grad_norm_.*')
 
 # Suppress noisy stderr (e.g. spconv GPU arch) and common warnings; install early.
 
@@ -162,6 +163,7 @@ def main():
                     _module_path = _module_path + '.' + m
                 print(_module_path)
                 plg_lib = importlib.import_module(_module_path)
+            from projects.mmdet3d_plugin.apis.train import custom_train_model
 
     plg_lib = importlib.import_module('mmdet3d')
 
@@ -291,7 +293,7 @@ def main():
             if hasattr(datasets[0], 'PALETTE') else None)
     # add an attribute for visualization convenience
     model.CLASSES = datasets[0].CLASSES
-    train_model(
+    custom_train_model(
         model,
         datasets,
         cfg,

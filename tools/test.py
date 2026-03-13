@@ -1,9 +1,24 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import mmcv
+from mmdet.datasets import replace_ImageToTensor
+from mmdet.apis import multi_gpu_test, set_random_seed
+from mmdet3d.models import build_model
+from mmdet3d.datasets import build_dataloader, build_dataset
+from mmdet3d.apis import single_gpu_test
+import mmdet
+from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
+                         wrap_fp16_model)
+from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
+from mmcv.cnn import fuse_conv_bn
+from mmcv import Config, DictAction
+import torch
 import argparse
 import os
 import warnings
 
 # Suppress noisy stderr (e.g. spconv GPU arch) and common warnings; install early.
+
+
 def _install_suppress():
     try:
         from tools.suppress_warnings import install_suppress
@@ -11,20 +26,6 @@ def _install_suppress():
         from suppress_warnings import install_suppress
     install_suppress()
 
-import mmcv
-import torch
-from mmcv import Config, DictAction
-from mmcv.cnn import fuse_conv_bn
-from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
-from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
-                         wrap_fp16_model)
-
-import mmdet
-from mmdet3d.apis import single_gpu_test
-from mmdet3d.datasets import build_dataloader, build_dataset
-from mmdet3d.models import build_model
-from mmdet.apis import multi_gpu_test, set_random_seed
-from mmdet.datasets import replace_ImageToTensor
 
 if mmdet.__version__ > '2.23.0':
     # If mmdet version > 2.23.0, setup_multi_processes would be imported and
@@ -283,6 +284,38 @@ def main():
         if args.format_only:
             dataset.format_results(outputs, **kwargs)
         if args.eval:
+            # Pred vs GT mean diagnostic (lidar frame) to debug mAP≈0
+            _results = outputs['bbox_results'] if isinstance(outputs, dict) else outputs
+            pred_xy_list, gt_xy_list = [], []
+            import numpy as np
+            n_diag = min(500, len(_results), len(dataset.data_infos))
+            for i in range(n_diag):
+                det = _results[i]
+                info = dataset.data_infos[i]
+                if 'gt_boxes' not in info or len(info['gt_boxes']) == 0:
+                    continue
+                boxes = det.get('boxes_3d_det') or det.get('boxes_3d')
+                if boxes is None or (hasattr(boxes, '__len__') and len(boxes) == 0):
+                    continue
+                if hasattr(boxes, 'gravity_center'):
+                    pred_xy = boxes.gravity_center.numpy()[:, :2]
+                elif hasattr(boxes, 'numpy'):
+                    pred_xy = boxes.numpy()[:, :2]
+                else:
+                    pred_xy = np.asarray(boxes)[:, :2]
+                gt_xy = np.asarray(info['gt_boxes'])[:, :2]
+                pred_xy_list.append(pred_xy)
+                gt_xy_list.append(gt_xy)
+            if pred_xy_list and gt_xy_list:
+                pred_mean = np.concatenate(pred_xy_list, axis=0).mean(0)
+                gt_mean = np.concatenate(gt_xy_list, axis=0).mean(0)
+                print('[DIAG] Pred vs GT mean (lidar xy):')
+                print(f'  Pred mean (x,y): {pred_mean}')
+                print(f'  GT mean (x,y):   {gt_mean}')
+                print(f'  Offset (x,y):    {pred_mean - gt_mean}')
+            else:
+                print('[DIAG] No overlapping pred+GT samples for mean comparison.')
+
             eval_kwargs = cfg.get('evaluation', {}).copy()
             # hard-code way to remove EvalHook args
             for key in [

@@ -516,6 +516,8 @@ def parse_args():
     parser.add_argument('--info-prefix', type=str, default="spd")
     parser.add_argument('--max-workers', type=int, default=8,
                         help='Thread workers for sample_annotation_json')
+    parser.add_argument('--inf-labels-in-world-frame', action='store_true',
+                        help='Infrastructure: 3d_location in label is world frame, convert to lidar')
 
     args = parser.parse_args()
     return args
@@ -558,7 +560,8 @@ if __name__ == "__main__":
             info_prefix,
             version=version,
             max_sweeps=10,
-            flag_save=True)
+            flag_save=True,
+            inf_labels_in_world_frame=args.inf_labels_in_world_frame)
 
     save_root = osp.join(args.save_root, v2x_side)
 

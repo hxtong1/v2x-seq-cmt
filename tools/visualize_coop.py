@@ -1,5 +1,6 @@
 import struct
 import argparse
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import json
 import os
 import cv2
@@ -201,7 +202,8 @@ def _load_original_lidar_labels(data_root, frame_id):
     返回 annotations 列表，失败返回 None。
     """
     for prefix in ['vehicle-side', '']:
-        path = osp.join(data_root, prefix, 'label', 'lidar', f'{frame_id}.json')
+        path = osp.join(data_root, prefix, 'label',
+                        'lidar', f'{frame_id}.json')
         if osp.isfile(path):
             with open(path, 'r') as f:
                 return json.load(f)
@@ -249,7 +251,8 @@ def _compute_num_pts_per_box(pts_xyz, boxes):
 
 def _points_lidar_to_img(pts_lidar, lidar2cam_r, lidar2cam_t, cam_intrinsic):
     """Project lidar points to image. pts_lidar (N,3), returns (N,2) uv, (N,) depth, (N,) valid."""
-    pts_cam = (lidar2cam_r @ pts_lidar.T).T + np.array(lidar2cam_t).reshape(1, 3)
+    pts_cam = (lidar2cam_r @ pts_lidar.T).T + \
+        np.array(lidar2cam_t).reshape(1, 3)
     pts_2d = (cam_intrinsic @ pts_cam.T).T
     depth = pts_cam[:, 2]
     valid = depth > 0.1
@@ -262,7 +265,8 @@ def _points_lidar_to_img(pts_lidar, lidar2cam_r, lidar2cam_t, cam_intrinsic):
 def _box_center_in_cam_fov(box, lidar2cam_r, lidar2cam_t, cam_intrinsic, imsize):
     """Check if box center projects inside image FOV. box (7,), imsize (W,H)."""
     center = np.array([[box[0], box[1], box[2]]])
-    uv, depth, valid = _points_lidar_to_img(center, lidar2cam_r, lidar2cam_t, cam_intrinsic)
+    uv, depth, valid = _points_lidar_to_img(
+        center, lidar2cam_r, lidar2cam_t, cam_intrinsic)
     if not valid[0] or depth[0] <= 0:
         return False
     u, v = uv[0, 0], uv[0, 1]
@@ -304,7 +308,9 @@ def compute_iou_bev(box1, box2):
     from shapely.geometry import Polygon as ShapelyPolygon
 
     def box_to_poly(box):
-        x, y, z, dx, dy, dz, yaw = box[:7]
+        # box: (x,y,z,w,l,h,yaw)，dx=length(前向)，dy=width(侧向)
+        x, y, z, w, l, h, yaw = box[:7]
+        dx, dy = l, w
         corners = np.array([
             [dx/2,  dy/2],
             [dx/2, -dy/2],
@@ -329,23 +335,115 @@ def compute_iou_bev(box1, box2):
     return inter / union if union > 0 else 0.0
 
 
+def _lidar_bev_to_pixel(x, y, H, W, x_range=(-60, 60), y_range=(-60, 60)):
+    """Map lidar (x,y) to image pixel (px, py). x=forward, y=left. Origin at center."""
+    px = (x - x_range[0]) / (x_range[1] - x_range[0]) * (W - 1)
+    py = (y_range[1] - y) / (y_range[1] - y_range[0]) * (H - 1)  # flip y
+    return int(np.clip(px, 0, W - 1)), int(np.clip(py, 0, H - 1))
+
+
+def _render_single_bev_frame_cv(args):
+    """
+    快速 OpenCV 渲染单帧 BEV，替代 matplotlib，约 10-50x 加速。
+    Returns (idx, img) or (idx, None) on failure.
+    """
+    idx, info, data_root, frame_size, downsample, draw_text = args
+    H, W = frame_size[1], frame_size[0]
+    x_range, y_range = (-60, 60), (-60, 60)
+
+    def box_corners_bev(box):
+        # box: (x,y,z,w,l,h,yaw) SECOND 格式；BEV 局部 x=前向(length)，y=左(width)
+        x, y, z, w, l, h, yaw = box[:7]
+        dx, dy = l, w  # 前向用 length，侧向用 width
+        corners = np.array([
+            [dx/2, dy/2], [dx/2, -dy/2], [-dx/2, -dy/2], [-dx/2, dy/2]
+        ])
+        R = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+        corners = corners @ R.T + np.array([x, y])
+        return corners
+
+    try:
+        pts = _load_points_xyz(osp.join(data_root, info['lidar_path']))
+    except Exception:
+        return (idx, None)
+
+    # 下采样点云
+    if downsample > 1:
+        pts = pts[::downsample]
+
+    img = np.ones((H, W, 3), dtype=np.uint8) * 255
+    # 绘制点云（投影到像素）
+    px = ((pts[:, 0] - x_range[0]) / (x_range[1] - x_range[0]) * (W - 1)).astype(np.int32)
+    py = ((y_range[1] - pts[:, 1]) / (y_range[1] - y_range[0]) * (H - 1)).astype(np.int32)
+    valid = (px >= 0) & (px < W) & (py >= 0) & (py < H)
+    img[py[valid], px[valid]] = 0
+
+    boxes = info.get('gt_boxes', [])
+    velocities = info.get('gt_velocity', [None] * len(boxes))
+    track_ids = info.get('track_ids', [None] * len(boxes))
+    classes = info.get('gt_classes', [None] * len(boxes))
+
+    VEL_ABNORMAL_THRESH = 30.0  # m/s，超过此值视为异常速度
+
+    for i, box in enumerate(boxes):
+        corners = box_corners_bev(box)
+        pts_px = np.array([_lidar_bev_to_pixel(c[0], c[1], H, W, x_range, y_range) for c in corners])
+        pts_px = pts_px.reshape((-1, 1, 2)).astype(np.int32)
+        vel_norm = np.linalg.norm(velocities[i]) if velocities[i] is not None else 0.0
+        box_color = (0, 0, 255) if vel_norm > VEL_ABNORMAL_THRESH else (0, 255, 0)  # BGR: 红/绿
+        cv2.polylines(img, [pts_px], True, box_color, 1)
+        if velocities[i] is not None:
+            vx, vy = velocities[i][:2]
+            x2, y2 = box[0] + vx * 0.5, box[1] + vy * 0.5
+            p1 = _lidar_bev_to_pixel(box[0], box[1], H, W, x_range, y_range)
+            p2 = _lidar_bev_to_pixel(x2, y2, H, W, x_range, y_range)
+            cv2.arrowedLine(img, p1, p2, (0, 0, 255), 1, tipLength=0.2)
+        if draw_text:
+            cx, cy = _lidar_bev_to_pixel(box[0], box[1], H, W, x_range, y_range)
+            txt = ""
+            if track_ids[i] is not None:
+                txt += f"ID:{track_ids[i]} "
+            if classes[i] is not None:
+                txt += f"Cls:{classes[i]} "
+            txt += f"Frm:{idx}"
+            cv2.putText(img, txt, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 0), 1)
+    return (idx, img)
+
+
+def _render_single_bev_frame(args):
+    """
+    Worker for export_video: 使用 OpenCV 快速渲染 (fast=True 时) 或 matplotlib 渲染。
+    Returns (idx, img) or (idx, None) on failure.
+    """
+    # 新接口支持 (idx, info, data_root, frame_size, downsample, draw_text)
+    if len(args) >= 6:
+        return _render_single_bev_frame_cv(args)
+    # 兼容旧调用
+    idx, info, data_root, frame_size = args[:4]
+    return _render_single_bev_frame_cv((
+        idx, info, data_root, frame_size,
+        5,   # downsample
+        False  # draw_text off for speed
+    ))
+
+
 # ===============================
 # 主类
 # ===============================
 
 class SPDVisualizer:
-
     def __init__(self,
                  info_path,
                  data_root,
                  pred_path=None,
                  v2x_side='vehicle',
+                 max_frames=None,
                  coop=False):
 
         self.data_root = data_root
         self.v2x_side = v2x_side
         self.coop = coop
-
+        self.max_frames = max_frames
         with open(info_path, 'rb') as f:
             raw = pickle.load(f)
 
@@ -374,7 +472,8 @@ class SPDVisualizer:
                 if osp.isfile(data_info_path):
                     with open(data_info_path, 'r') as f:
                         all_infos = json.load(f)
-                    self._veh_data_infos = {d['frame_id']: d for d in all_infos}
+                    self._veh_data_infos = {
+                        d['frame_id']: d for d in all_infos}
                     self._veh_root = candidate
                     break
             else:
@@ -385,10 +484,12 @@ class SPDVisualizer:
             return None
         root = getattr(self, '_veh_root', self.data_root)
         try:
-            calib = json.load(open(osp.join(root, di['calib_lidar_to_camera_path'])))
+            calib = json.load(
+                open(osp.join(root, di['calib_lidar_to_camera_path'])))
             intr_path = osp.join(root, di['calib_camera_intrinsic_path'])
             intr_data = json.load(open(intr_path))
-            intr = np.array(intr_data.get('P', intr_data.get('cam_K', np.eye(3)))).reshape(3, 4)[:3, :3]
+            intr = np.array(intr_data.get('P', intr_data.get(
+                'cam_K', np.eye(3)))).reshape(3, 4)[:3, :3]
             return {
                 'lidar2cam_rotation': np.array(calib['rotation']),
                 'lidar2cam_translation': np.array(calib['translation']),
@@ -431,7 +532,9 @@ class SPDVisualizer:
     # ===============================
 
     def box_to_corners(self, box):
-        x, y, z, dx, dy, dz, yaw = box[:7]
+        # box: (x,y,z,w,l,h,yaw)，局部 x=length(前向)，y=width(侧向)，z=height
+        x, y, z, w, l, h, yaw = box[:7]
+        dx, dy, dz = l, w, h
 
         corners = np.array([
             [dx/2,  dy/2, -dz/2],
@@ -510,14 +613,18 @@ class SPDVisualizer:
             lidar2cam_r = np.array(cam.get('lidar2cam_rotation'))
             lidar2cam_t = np.array(cam.get('lidar2cam_translation')).reshape(3)
             intr = np.array(cam.get('cam_intrinsic', cam.get('cam_K')))
-            intr = intr.reshape(3, 4)[:3, :3] if intr.size == 12 else intr.reshape(3, 3)
-            fov_poly = _get_camera_fov_bev_polygon(lidar2cam_r, lidar2cam_t, intr, imsize, depth=80.0)
+            intr = intr.reshape(
+                3, 4)[:3, :3] if intr.size == 12 else intr.reshape(3, 3)
+            fov_poly = _get_camera_fov_bev_polygon(
+                lidar2cam_r, lidar2cam_t, intr, imsize, depth=80.0)
             for i, box in enumerate(boxes):
-                in_fov_mask[i] = _box_center_in_cam_fov(box, lidar2cam_r, lidar2cam_t, intr, imsize)
+                in_fov_mask[i] = _box_center_in_cam_fov(
+                    box, lidar2cam_r, lidar2cam_t, intr, imsize)
 
         if fov_poly is not None:
             from matplotlib.patches import Polygon as MplPolygon
-            fov_patch = MplPolygon(fov_poly, fill=True, alpha=0.15, edgecolor='blue', linewidth=2, label='Camera FOV')
+            fov_patch = MplPolygon(
+                fov_poly, fill=True, alpha=0.15, edgecolor='blue', linewidth=2, label='Camera FOV')
             ax.add_patch(fov_patch)
         else:
             # 无相机标定时，用近似前向 70° 扇形作为参考
@@ -525,7 +632,8 @@ class SPDVisualizer:
             r = 80
             fov_approx = np.column_stack([r * np.cos(th), r * np.sin(th)])
             from matplotlib.patches import Polygon as MplPolygon
-            fov_patch = MplPolygon(fov_approx, fill=True, alpha=0.1, edgecolor='cyan', linewidth=1.5, label='Approx FOV (70deg)')
+            fov_patch = MplPolygon(fov_approx, fill=True, alpha=0.1,
+                                   edgecolor='cyan', linewidth=1.5, label='Approx FOV (70deg)')
             ax.add_patch(fov_patch)
 
         for i, box in enumerate(boxes):
@@ -539,9 +647,11 @@ class SPDVisualizer:
             ax.add_patch(poly)
             if velocities is not None and i < len(velocities):
                 vx, vy = velocities[i][:2]
-                ax.arrow(box[0], box[1], vx * 0.5, vy * 0.5, head_width=0.3, color=color)
+                ax.arrow(box[0], box[1], vx * 0.5, vy *
+                         0.5, head_width=0.3, color=color)
 
-        n_in = int(in_fov_mask.sum()) if (in_fov_mask.size == len(boxes)) else -1
+        n_in = int(in_fov_mask.sum()) if (
+            in_fov_mask.size == len(boxes)) else -1
         n_out = len(boxes) - n_in if n_in >= 0 else -1
         ax.set_aspect('equal')
         ax.set_xlim(-60, 60)
@@ -576,7 +686,8 @@ class SPDVisualizer:
 
         annos = _load_original_lidar_labels(self.data_root, frame_id)
         if annos is None:
-            print(f"Original SPD label not found: {self.data_root}/.../label/lidar/{frame_id}.json")
+            print(
+                f"Original SPD label not found: {self.data_root}/.../label/lidar/{frame_id}.json")
             return
 
         boxes = _lidar_label_json_to_boxes(annos)
@@ -593,14 +704,16 @@ class SPDVisualizer:
             poly = Polygon(corners, fill=False, edgecolor=color, linewidth=1.5)
             ax.add_patch(poly)
             if num_pts[i] > 0:
-                ax.text(box[0], box[1], str(num_pts[i]), fontsize=6, color='darkgreen')
+                ax.text(box[0], box[1], str(num_pts[i]),
+                        fontsize=6, color='darkgreen')
 
         ax.set_aspect('equal')
         ax.set_xlim(-60, 60)
         ax.set_ylim(-60, 60)
         ax.set_xlabel('X (forward)')
         ax.set_ylabel('Y (left)')
-        plt.title(f'原始 SPD label | 绿=有点云({n_has}) 红=无点云({n_no}) | 共{len(boxes)}个框')
+        plt.title(
+            f'原始 SPD label | 绿=有点云({n_has}) 红=无点云({n_no}) | 共{len(boxes)}个框')
         plt.tight_layout()
         if save_path:
             plt.savefig(save_path, dpi=150)
@@ -626,11 +739,13 @@ class SPDVisualizer:
 
         for box in boxes_orig:
             corners = self.box_to_corners(box)[:4, :2]
-            poly = Polygon(corners, fill=False, edgecolor='cyan', linewidth=1.5)
+            poly = Polygon(corners, fill=False,
+                           edgecolor='cyan', linewidth=1.5)
             ax.add_patch(poly)
         for box in boxes_gt:
             corners = self.box_to_corners(box)[:4, :2]
-            poly = Polygon(corners, fill=False, edgecolor='red', linewidth=1.0, linestyle='--')
+            poly = Polygon(corners, fill=False, edgecolor='red',
+                           linewidth=1.0, linestyle='--')
             ax.add_patch(poly)
 
         ax.set_aspect('equal')
@@ -667,7 +782,8 @@ class SPDVisualizer:
         lidar2cam_t = np.array(cam.get('lidar2cam_translation'))
         intr = np.array(cam.get('cam_intrinsic')).reshape(3, 3)[:3, :3]
         dp = cam.get('data_path', '')
-        img_path = dp if cam.get('data_path_is_absolute') else osp.join(self.data_root, dp)
+        img_path = dp if cam.get(
+            'data_path_is_absolute') else osp.join(self.data_root, dp)
         if not osp.isfile(img_path):
             print("Image not found:", img_path)
             return
@@ -681,28 +797,35 @@ class SPDVisualizer:
         # 投影点云（采样以加速）
         step = max(1, len(pts) // 30000)
         pts_sub = pts[::step]
-        uv, depth, valid = _points_lidar_to_img(pts_sub, lidar2cam_r, lidar2cam_t, intr)
-        in_img = valid & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h) & (depth > 0)
+        uv, depth, valid = _points_lidar_to_img(
+            pts_sub, lidar2cam_r, lidar2cam_t, intr)
+        in_img = valid & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (
+            uv[:, 1] >= 0) & (uv[:, 1] < h) & (depth > 0)
         pts_vis = uv[in_img]
         depth_vis = depth[in_img]
         # 深度着色
-        depth_norm = (depth_vis - depth_vis.min()) / (depth_vis.max() - depth_vis.min() + 1e-6)
+        depth_norm = (depth_vis - depth_vis.min()) / \
+            (depth_vis.max() - depth_vis.min() + 1e-6)
         colors = plt.cm.jet(depth_norm)[:, :3] * 255
         for i in range(len(pts_vis)):
-            cv2.circle(img, (int(pts_vis[i, 0]), int(pts_vis[i, 1])), 1, colors[i].tolist(), -1)
+            cv2.circle(img, (int(pts_vis[i, 0]), int(
+                pts_vis[i, 1])), 1, colors[i].tolist(), -1)
 
         # 投影 3D 框
         for box in boxes:
             corners = self.box_to_corners(box)
-            uv_c, depth_c, valid_c = _points_lidar_to_img(corners, lidar2cam_r, lidar2cam_t, intr)
+            uv_c, depth_c, valid_c = _points_lidar_to_img(
+                corners, lidar2cam_r, lidar2cam_t, intr)
             if not np.all(valid_c) or np.any(depth_c <= 0):
                 continue
             uv_c = uv_c.astype(np.int32)
-            in_img_c = (uv_c[:, 0] >= 0) & (uv_c[:, 0] < w) & (uv_c[:, 1] >= 0) & (uv_c[:, 1] < h)
+            in_img_c = (uv_c[:, 0] >= 0) & (uv_c[:, 0] < w) & (
+                uv_c[:, 1] >= 0) & (uv_c[:, 1] < h)
             if np.sum(in_img_c) >= 2:
                 pts_2d = uv_c
                 for k in [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]]:
-                    cv2.line(img, tuple(pts_2d[k[0]]), tuple(pts_2d[k[1]]), (0, 255, 0), 2)
+                    cv2.line(img, tuple(pts_2d[k[0]]), tuple(
+                        pts_2d[k[1]]), (0, 255, 0), 2)
 
         if save_path:
             cv2.imwrite(save_path, img)
@@ -712,18 +835,21 @@ class SPDVisualizer:
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
-    def analyze_gt_fov(self, max_frames=50):
+    def analyze_gt_fov(self, max_frames=None):
         """统计 GT 框在相机 FOV 内/外的数量，验证是否仅对图像区域标注。"""
         print("=== GT vs Camera FOV Analysis ===\n")
         total_in, total_out = 0, 0
-        for idx in range(min(max_frames, len(self.infos))):
+        max_frames = self.max_frames if max_frames is None else max_frames
+        n_frames = len(self.infos) if (max_frames is None or (isinstance(max_frames, str) and max_frames.lower() == "all")) else min(int(max_frames), len(self.infos))
+        for idx in range(n_frames):
             info = self.infos[idx]
             boxes = info.get('gt_boxes', [])
             if len(boxes) == 0:
                 continue
             cams = info.get('cams') or {}
             if not cams and hasattr(self, '_load_cams_for_coop_frame'):
-                cam_data = self._load_cams_for_coop_frame(info.get('token', ''))
+                cam_data = self._load_cams_for_coop_frame(
+                    info.get('token', ''))
                 if cam_data:
                     cams = {'cam': cam_data}
             if not cams:
@@ -731,7 +857,8 @@ class SPDVisualizer:
                 continue
             cam = list(cams.values())[0]
             lidar2cam_r = np.array(cam.get('lidar2cam_rotation', np.eye(3)))
-            lidar2cam_t = np.array(cam.get('lidar2cam_translation', np.zeros(3)))
+            lidar2cam_t = np.array(
+                cam.get('lidar2cam_translation', np.zeros(3)))
             intr = np.array(cam.get('cam_intrinsic')).reshape(3, 3)[:3, :3]
             imsize = (1920, 1080)
             n_in, n_out = 0, 0
@@ -744,8 +871,10 @@ class SPDVisualizer:
             total_out += n_out
             if (n_in + n_out) > 0:
                 pct = 100 * n_in / (n_in + n_out)
-                print(f"Frame {idx}: in_fov={n_in}, out_fov={n_out}, in_fov%={pct:.1f}%")
-        print(f"\nTotal: in_fov={total_in}, out_fov={total_out}, in_fov%={100*total_in/(total_in+total_out+1e-6):.1f}%")
+                print(
+                    f"Frame {idx}: in_fov={n_in}, out_fov={n_out}, in_fov%={pct:.1f}%")
+        print(
+            f"\nTotal: in_fov={total_in}, out_fov={total_out}, in_fov%={100*total_in/(total_in+total_out+1e-6):.1f}%")
         if total_out == 0 and total_in > 0:
             print("=> GT 全部在图像 FOV 内，支持「仅对图像区域标注」的假设。")
         elif total_out > 0:
@@ -871,60 +1000,61 @@ class SPDVisualizer:
     # 视频导出
     # ===============================
 
-    def export_video(self, save_path='bev_video.mp4', max_frames=50, fps=10):
+    def export_video(self, save_path='bev_video.mp4', max_frames=None, fps=10, workers=None,
+                     fast=True, downsample=5, draw_text=False, use_processes=True):
         """
-        导出 BEV 视频，可在 Windows 上播放
+        导出 BEV 视频。fast=True 使用 OpenCV 渲染。use_processes=True 用多进程(突破GIL)，否则多线程。
         """
-        import cv2
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Polygon
-        import numpy as np
+        if max_frames is None:
+            max_frames = self.max_frames
 
-        frame_size = (800, 800)  # 视频分辨率，需与绘图 figsize 对应
+        frame_size = (800, 800)
+        n_workers = workers if workers is not None else min(8, (os.cpu_count() or 4))
 
-        # VideoWriter codec: 'mp4v' 兼容 Windows
+        if max_frames is None or (isinstance(max_frames, str) and max_frames.lower() == "all"):
+            frames_range = list(range(len(self.infos)))
+        else:
+            frames_range = list(range(min(int(max_frames), len(self.infos))))
+
+        if fast:
+            task_args = [
+                (idx, self.infos[idx], self.data_root, frame_size, downsample, draw_text)
+                for idx in frames_range
+            ]
+        else:
+            task_args = [
+                (idx, self.infos[idx], self.data_root, frame_size)
+                for idx in frames_range
+            ]
+
+        results = {}
+        ExecutorClass = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+
+        with ExecutorClass(max_workers=n_workers) as executor:
+            worker_fn = _render_single_bev_frame_cv if fast else _render_single_bev_frame
+            futures = {executor.submit(worker_fn, args): args[0]
+                       for args in task_args}
+            done = 0
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    _, img = future.result()
+                    if img is not None:
+                        results[idx] = img
+                except Exception as e:
+                    print(f"Frame {idx} render failed: {e}")
+                done += 1
+                if done % 10 == 0:
+                    print(f"Rendered {done}/{len(frames_range)} frames")
+
+        # 按顺序写入视频
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video = cv2.VideoWriter(save_path, fourcc, fps, frame_size)
-
-        for idx in range(min(max_frames, len(self.infos))):
-            info = self.infos[idx]
-            try:
-                pts = _load_points_xyz(os.path.join(
-                    self.data_root, info['lidar_path']))
-            except Exception as e:
-                print(f"Frame {idx} lidar load failed:", e)
-                continue
-
-            boxes = info.get('gt_boxes', [])
-
-            # 绘图
-            fig, ax = plt.subplots(figsize=(8, 8), dpi=100)
-            ax.scatter(pts[:, 0], pts[:, 1], s=0.3, c='k')
-
-            for box in boxes:
-                corners = self.box_to_corners(box)[:4, :2]
-                poly = Polygon(corners, fill=False,
-                               edgecolor='r', linewidth=1.0)
-                ax.add_patch(poly)
-
-            ax.set_aspect('equal')
-            ax.set_xlim(-50, 50)
-            ax.set_ylim(-50, 50)
-            ax.axis('off')
-            plt.tight_layout()
-
-            # 将 matplotlib canvas 转为 OpenCV image
-            fig.canvas.draw()
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-            img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-            # 写入视频
-            video.write(img)
-            plt.close(fig)
-
+        for idx in frames_range:
+            if idx in results:
+                video.write(results[idx])
         video.release()
-        print("Video saved and playable on Windows:", save_path)
+        print(f"Saved BEV video: {save_path} ({len(results)} frames)")
 
     # ===============================
     # 主运行
@@ -940,14 +1070,28 @@ class SPDVisualizer:
             analyze_fov=False,
             check_continuity=False,
             export_video=False,
-            save_dir=None):
+            save_dir=None,
+            max_frames=None,
+            workers=None,
+            export_fast=True,
+            export_downsample=5,
+            export_draw_text=False,
+            export_use_processes=True):
+
+        max_frames = max_frames if max_frames is not None else self.max_frames
 
         if analyze_fov:
-            self.analyze_gt_fov(max_frames=100)
+            self.analyze_gt_fov(max_frames=max_frames)
             return
 
         if export_video:
-            self.export_video(save_path='bev_video.mp4', max_frames=200)
+            self.export_video(save_path='bev_video.mp4',
+                              max_frames=max_frames,
+                              workers=workers,
+                              fast=export_fast,
+                              downsample=export_downsample,
+                              draw_text=export_draw_text,
+                              use_processes=export_use_processes)
             return
 
         info = self.infos[frame_idx]
@@ -988,7 +1132,8 @@ class SPDVisualizer:
             )
 
         if show_3d:
-            self.visualize_3d(pts, boxes, save_path=f"{pf}_3d.png" if pf else "frame3d.png")
+            self.visualize_3d(
+                pts, boxes, save_path=f"{pf}_3d.png" if pf else "frame3d.png")
 
         if check_continuity:
             self.check_velocity_continuity()
@@ -1020,19 +1165,46 @@ def parse_args():
                         help='Count GT in/out camera FOV across frames')
     parser.add_argument('--check_continuity', action='store_true')
     parser.add_argument('--export_video', action='store_true')
+    parser.add_argument('--max_frames', '--max_frames_str', type=str, default=None,
+                        dest='max_frames',
+                        help='Max frames for analyze_fov/export_video: int or "all" for all frames')
+    parser.add_argument('--workers', type=int, default=None,
+                        help='Number of threads for export_video (default: min(8, cpu_count))')
+    parser.add_argument('--no_fast_export', action='store_true',
+                        help='Use matplotlib for export_video (slower, default uses OpenCV)')
+    parser.add_argument('--export_downsample', type=int, default=5,
+                        help='Point cloud downsample factor for export_video (default: 5)')
+    parser.add_argument('--export_draw_text', action='store_true',
+                        help='Draw ID/class text on each box in export_video')
+    parser.add_argument('--use_threads', action='store_true',
+                        help='Use threads instead of processes for export_video (default: processes)')
 
     return parser.parse_args()
+
+
+def _parse_max_frames(s):
+    """Parse max_frames from str: None/''/'all' -> None (all frames), '100' -> 100."""
+    if s is None or s == "":
+        return None
+    if isinstance(s, str) and s.lower() == "all":
+        return None
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return None
 
 
 if __name__ == "__main__":
 
     args = parse_args()
+    max_frames = _parse_max_frames(args.max_frames)
 
     visualizer = SPDVisualizer(
         info_path=args.info_path,
         data_root=args.data_root,
         pred_path=args.pred_path,
-        v2x_side=args.v2x_side
+        v2x_side=args.v2x_side,
+        max_frames=max_frames
     )
 
     visualizer.run(
@@ -1045,5 +1217,11 @@ if __name__ == "__main__":
         analyze_fov=args.analyze_fov,
         check_continuity=args.check_continuity,
         export_video=args.export_video,
-        save_dir=args.save_dir
+        save_dir=args.save_dir,
+        max_frames=max_frames,
+        workers=args.workers,
+            export_fast=not args.no_fast_export,
+            export_downsample=args.export_downsample,
+            export_draw_text=args.export_draw_text,
+            export_use_processes=not args.use_threads
     )

@@ -1,92 +1,222 @@
-_base_ = ["../_base_/datasets/nus-3d.py", "../_base_/default_runtime.py"]
-
+_base_ = ["../_base_/default_runtime.py", "../_base_/datasets/nus-3d.py"]
 plugin = True
-plugin_dir = "projects/mmdet3d_plugin/"
-# If point cloud range is changed, the models should also change their point
-# cloud range accordingly
-point_cloud_range = [0, -51.2, -5.0, 102.4, 51.2, 3.0]
+plugin_dir = 'projects/mmdet3d_plugin/'
+
+# Infrastructure-side pc_range (keep as set; do not modify)
+point_cloud_range = [0, -46.08, -3.0, 102.4, 46.08, 1.0]
 post_center_range = [-10.0, -61.2, -10.0, 112.4, 61.2, 10.0]
-new_range_100 = True
 
-voxel_size = [0.2, 0.2, 8]
-patch_size = [102.4, 102.4]
-img_norm_cfg = dict(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
-class_names = [
-    "car",
-    "bicycle",
-    "pedestrian",
-]
+# voxel_size aligned with lidar track; grid computed from pc_range
+voxel_size = [0.16, 0.16, 0.1]
+# grid: x=(102.4-0)/0.16=640, y=(46.08-(-46.08))/0.16=576, z=(1-(-3))/0.1=40
+grid_size = [640, 576, 40]
+sparse_shape = [41, 576, 640]
+out_size_factor = 8
 
-#class_range for eva
-class_range={
+class_names = ['car', 'pedestrian', 'bicycle']
+class_range = {
     "car": 100,
     "bicycle": 80,
     "pedestrian": 80,
 }
+new_range_100 = True
 
-input_modality = dict(
-    use_lidar=False, use_camera=True, use_radar=False, use_map=False, use_external=True
-)
-_dim_ = 256
-_pos_dim_ = _dim_ // 2
-_ffn_dim_ = _dim_ * 2
-_num_levels_ = 1
-bev_h_ = 50
-bev_w_ = 50
-_feed_dim_ = _ffn_dim_
-_dim_half_ = _pos_dim_
-canvas_size = (bev_h_, bev_w_)
-num_query = 900
-
-# Other settings
-train_gt_iou_threshold = 0.3
-
-#save or not track query for coop
+# inf_query storage: set save_track_query=True to save track query for coop stage2
 save_track_query = False
 save_track_query_file_root = 'data/infos/inf_query'
 
-# stream training
-num_each_seq = 5 # 0: keep original sequences
-seq_mode = True
-queue_length = 1  # when stream training, queue_length=1
+input_modality = dict(
+    use_lidar=True,
+    use_camera=False,
+    use_radar=False,
+    use_map=False,
+    use_external=True)
+
+file_client_args = dict(backend="disk")
+
+dataset_type = "SPDDataset"
+data_root = "./datasets/V2X-Seq-SPD-New/infrastructure-side/"
+info_path = "./data/infos/V2X-Seq-SPD-New/infrastructure-side/"
+split_datas_file = "./data/split_datas/cooperative-split-data-spd.json"
+
 num_gpus = 4
-batch_size = 2 # batch on each gpu
-num_iters_per_epoch = 7445 // (num_gpus * batch_size)
-num_epochs = 24
-is_motion = True
+batch_size = 1
+queue_length = 5
+num_iters_per_epoch = 7110 // (num_gpus * batch_size)
+evaluation = dict(interval=20 * num_iters_per_epoch)
+
+train_pipeline = [
+    dict(
+        type='LoadPointsFromFile_E2E',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args,
+        pts_root=data_root),
+    dict(
+        type='LoadPointsFromMultiSweeps_E2E',
+        sweeps_num=10,
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args,
+        pts_root=data_root,
+    ),
+    dict(type='LoadAnnotations3D_E2E',
+         with_bbox_3d=True,
+         with_label_3d=True,
+         with_attr_label=False,
+         with_future_anns=False,
+         with_ins_inds_3d=True,
+         ins_inds_add_1=True,
+         with_forecasting=False,
+         ),
+    dict(
+        type='SeqGlobalRotScaleTrans',
+        rot_range=[-0.3925 * 2, 0.3925 * 2],
+        scale_ratio_range=[0.9, 1.1],
+        translation_std=[0.5, 0.5, 0.5]),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type="ObjectRangeFilterTrack", point_cloud_range=point_cloud_range),
+    dict(type="ObjectNameFilterTrack", classes=class_names),
+    dict(type='DefaultFormatBundle3D', class_names=class_names),
+    dict(
+        type="CustomCollect3D",
+        keys=[
+            "gt_bboxes_3d",
+            "gt_labels_3d",
+            "gt_inds",
+            "points",
+            "timestamp",
+            "l2g_r_mat",
+            "l2g_t",
+        ],
+    ),
+]
+test_pipeline = [
+    dict(
+        type='LoadPointsFromFile_E2E',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args,
+        pts_root=data_root),
+    dict(
+        type='LoadPointsFromMultiSweeps_E2E',
+        sweeps_num=10,
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args,
+        pts_root=data_root,
+    ),
+    dict(
+        type='MultiScaleFlipAug3D',
+        img_scale=(1333, 800),
+        pts_scale_ratio=1,
+        flip=False,
+        transforms=[
+            dict(
+                type='GlobalRotScaleTrans',
+                rot_range=[0, 0],
+                scale_ratio_range=[1.0, 1.0],
+                translation_std=[0, 0, 0]),
+            dict(type='RandomFlip3D'),
+            dict(
+                type='DefaultFormatBundle3D',
+                class_names=class_names,
+                with_label=False),
+            dict(
+                type="CustomCollect3D",
+                keys=[
+                    "points",
+                    "timestamp",
+                    "l2g_r_mat",
+                    "l2g_t",
+                ]
+            ),
+        ])
+]
+data = dict(
+    samples_per_gpu=batch_size,
+    workers_per_gpu=8,
+    train=dict(
+        type=dataset_type,
+        forecasting=False,
+        data_root=data_root,
+        ann_file=info_path + 'spd_infos_temporal_train.pkl',
+        seq_mode=True,
+        load_interval=1,
+        queue_length=queue_length,
+        pipeline=train_pipeline,
+        classes=class_names,
+        modality=input_modality,
+        test_mode=False,
+        use_valid_flag=True,
+        filter_empty_gt=False,
+        split_datas_file=split_datas_file,
+        v2x_side='infrastructure_side',
+        class_range=class_range,
+        new_range_100=new_range_100,
+        box_type_3d='LiDAR'),
+    val=dict(
+        type=dataset_type,
+        file_client_args=file_client_args,
+        data_root=data_root,
+        ann_file=info_path + 'spd_infos_temporal_val.pkl',
+        pipeline=test_pipeline,
+        classes=class_names,
+        modality=input_modality,
+        samples_per_gpu=1,
+        v2x_side='infrastructure_side',
+        box_type_3d='LiDAR',
+        eval_mod=['det', 'track'],
+        split_datas_file=split_datas_file,
+        class_range=class_range,
+        new_range_100=new_range_100,
+    ),
+    test=dict(
+        type=dataset_type,
+        data_root=data_root,
+        ann_file=info_path + 'spd_infos_temporal_val.pkl',
+        pipeline=test_pipeline,
+        classes=class_names,
+        modality=input_modality,
+        test_mode=True,
+        v2x_side='infrastructure_side',
+        box_type_3d='LiDAR',
+        eval_mod=['det', 'track'],
+        split_datas_file=split_datas_file,
+        class_range=class_range,
+        new_range_100=new_range_100,
+    ),
+    shuffler_sampler=dict(type="InfiniteGroupEachSampleInBatchSampler"),
+    nonshuffler_sampler=dict(type="DistributedSampler"),
+)
 
 model = dict(
-    type="CoopTrack",
-    seq_mode=seq_mode,
-    batch_size=batch_size,
+    type='CMTCoopTracker',
+    pc_range=point_cloud_range,
+    queue_length=queue_length,
     save_track_query=save_track_query,
     save_track_query_file_root=save_track_query_file_root,
-    gt_iou_threshold=train_gt_iou_threshold,
-    queue_length=queue_length,
-    use_grid_mask=True,
+    class_birth_thresholds=[0.50, 0.40, 0.40],
+    train_track=True,
+    seq_mode=True,
+    batch_size=1,
     video_test_mode=True,
-    num_query=num_query,
-    num_classes=len(class_names),
-    pc_range=point_cloud_range,
-    post_center_range=post_center_range,
-    motion_prediction_ref_update=False,
-    runtime_tracker=dict(
-        output_threshold=0.3,
-        score_threshold=0.4,
-        record_threshold=0.0,
-        max_age_since_update=1,),
-    fp_ratio=0.3,
-    random_drop=0.1,
-    shuffle=False,
-    is_motion=is_motion,
     spatial_temporal_reason=dict(
-        num_classes=len(class_names),
-        is_motion=is_motion,
         history_reasoning=True,
         future_reasoning=False,
+        embed_dims=256,
         hist_len=4,
-        fut_len=8,
+        fut_len=4,
+        num_reg_fcs=2,
+        code_size=10,
+        num_classes=3,
         pc_range=point_cloud_range,
+        is_motion=False,
+        is_cooperation=False,
+        learn_match=False,
+        veh_thre=0.10,
         hist_temporal_transformer=dict(
             type='TemporalTransformer',
             decoder=dict(
@@ -107,7 +237,7 @@ model = dict(
                             embed_dims=256,
                             num_heads=8,
                             dropout=0.1),
-                        ],
+                    ],
                     feedforward_channels=2048,
                     ffn_dropout=0.1,
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
@@ -133,21 +263,89 @@ model = dict(
                             embed_dims=256,
                             num_heads=8,
                             dropout=0.1),
-                        ],
+                    ],
                     feedforward_channels=2048,
                     ffn_dropout=0.1,
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                                      'ffn', 'norm')),
             )),
-        fut_temporal_transformer=dict(
-            type='TemporalTransformer',
+    ),
+    runtime_tracker=dict(
+        score_threshold=0.5,
+        predict_score_thresh=0.05,
+        record_threshold=0.4,
+        output_threshold=0.1,
+        max_age_since_update=5,
+        iou_threshold=0.25,
+        min_active=1,
+        num_track_instance=300,
+    ),
+    pts_voxel_layer=dict(
+        num_point_features=5,
+        max_num_points=10,
+        voxel_size=voxel_size,
+        max_voxels=(160000, 200000),
+        point_cloud_range=point_cloud_range),
+    pts_voxel_encoder=dict(
+        type='HardSimpleVFE',
+        num_features=5,
+    ),
+    pts_middle_encoder=dict(
+        type='SparseEncoder',
+        in_channels=5,
+        sparse_shape=sparse_shape,
+        output_channels=256,
+        order=('conv', 'norm', 'act'),
+        encoder_channels=((16, 16, 32), (32, 32, 64),
+                          (64, 64, 128), (128, 128)),
+        encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
+        block_type='basicblock'),
+    pts_backbone=dict(
+        type='SECOND',
+        in_channels=512,
+        out_channels=[128, 256],
+        layer_nums=[5, 5],
+        layer_strides=[1, 2],
+        norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
+        conv_cfg=dict(type='Conv2d', bias=False)),
+    pts_neck=dict(
+        type='SECONDFPN',
+        in_channels=[128, 256],
+        out_channels=[256, 256],
+        upsample_strides=[1, 2],
+        norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
+        upsample_cfg=dict(type='deconv', bias=False),
+        use_conv_for_no_stride=True),
+    pts_bbox_head=dict(
+        type='CmtLidarHead',
+        in_channels=512,
+        hidden_dim=256,
+        downsample_scale=8,
+        common_heads=dict(center=(2, 2), height=(
+            1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
+        tasks=[
+            dict(num_class=3, class_names=['car', 'bicycle', 'pedestrian'])
+        ],
+        bbox_coder=dict(
+            type='MultiTaskBBoxTrackCoder',
+            post_center_range=[-61.2, -61.2, -10.0, 122.4, 61.2, 10.0],
+            pc_range=point_cloud_range,
+            max_num=300,
+            voxel_size=voxel_size,
+            num_classes=3,
+            score_threshold=0.2,
+            iou_thres=0.25,
+            with_nms=True),
+        separate_head=dict(
+            type='SeparateTaskHead', init_bias=-2.19, final_kernel=3),
+        transformer=dict(
+            type='CmtLidarTransformer',
             decoder=dict(
                 type='PETRTransformerDecoder',
                 return_intermediate=True,
-                num_layers=2,
+                num_layers=6,
                 transformerlayers=dict(
                     type='PETRTransformerDecoderLayer',
-                    with_cp=False,
                     attn_cfgs=[
                         dict(
                             type='MultiheadAttention',
@@ -155,363 +353,101 @@ model = dict(
                             num_heads=8,
                             dropout=0.1),
                         dict(
-                            type='PETRMultiheadAttention',
+                            type='PETRMultiheadFlashAttention',
                             embed_dims=256,
                             num_heads=8,
                             dropout=0.1),
-                        ],
-                    feedforward_channels=2048,
-                    ffn_dropout=0.1,
+                    ],
+                    ffn_cfgs=dict(
+                        type='FFN',
+                        embed_dims=256,
+                        feedforward_channels=1024,
+                        num_fcs=2,
+                        ffn_drop=0.,
+                        act_cfg=dict(type='ReLU', inplace=True),
+                    ),
+                    feedforward_channels=1024,
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                                      'ffn', 'norm')),
-            )),),
-    img_backbone=dict(
-        type='ResNet',
-        depth=50,
-        num_stages=4,
-        out_indices=(3,),
-        frozen_stages=1,
-        norm_cfg=dict(type='BN', requires_grad=False),
-        norm_eval=True,
-        style='pytorch'),
-    img_neck=dict(
-        type='FPN',
-        in_channels=[2048],
-        out_channels=_dim_,
-        start_level=0,
-        add_extra_convs='on_output',
-        num_outs=_num_levels_,
-        relu_before_extra_convs=True),
-    freeze_img_backbone=True,
-    freeze_img_neck=False,
-    freeze_bn=False,
-    loss_cfg=dict(
-        type="ClipMatcher",
-        num_classes=len(class_names),
-        weight_dict=None,
-        code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
-        assigner=dict(
-            type="HungarianAssigner3DTrack",
-            cls_cost=dict(type="FocalLossCost", weight=2.0),
-            reg_cost=dict(type="BBox3DL1Cost", weight=0.25),
-            pc_range=point_cloud_range,
-        ),
+            )),
         loss_cls=dict(
-            type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=2.0
-        ),
-        loss_bbox=dict(type="L1Loss", loss_weight=0.25),
-        loss_past_traj_weight=0.0,
-        loss_prediction=dict(type='L1Loss', loss_weight=0.5),
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2,
+            alpha=0.25,
+            reduction='mean',
+            loss_weight=2.0),
+        loss_bbox=dict(
+            type='L1Loss',
+            reduction='mean',
+            loss_weight=0.5),
+        loss_heatmap=dict(
+            type='GaussianFocalLoss',
+            reduction='mean',
+            loss_weight=1.0),
     ),
-    pts_bbox_head=dict(
-        type="BEVFormerTrackHead",
-        bev_h=bev_h_,
-        bev_w=bev_w_,
-        num_query=num_query,
-        num_classes=len(class_names),
-        in_channels=_dim_,
-        sync_cls_avg_factor=True,
-        with_box_refine=True,
-        as_two_stage=False,
-        transformer=dict(
-            type="PerceptionTransformer",
-            rotate_prev_bev=True,
-            use_shift=True,
-            use_can_bus=True,
-            embed_dims=_dim_,
-            encoder=dict(
-                type="BEVFormerEncoder",
-                num_layers=3,
-                pc_range=point_cloud_range,
-                num_points_in_pillar=4,
-                return_intermediate=False,
-                transformerlayers=dict(
-                    type="BEVFormerLayer",
-                    attn_cfgs=[
-                        dict(
-                            type="TemporalSelfAttention", embed_dims=_dim_, num_levels=1
-                        ),
-                        dict(
-                            type="SpatialCrossAttention",
-                            pc_range=point_cloud_range,
-                            deformable_attention=dict(
-                                type="MSDeformableAttention3D",
-                                embed_dims=_dim_,
-                                num_points=8,
-                                num_levels=_num_levels_,
-                            ),
-                            embed_dims=_dim_,
-                        ),
-                    ],
-                    feedforward_channels=_ffn_dim_,
-                    ffn_dropout=0.1,
-                    operation_order=(
-                        "self_attn",
-                        "norm",
-                        "cross_attn",
-                        "norm",
-                        "ffn",
-                        "norm",
-                    ),
-                ),
-            ),
-            decoder=dict(
-                type="DetectionTransformerDecoder",
-                num_layers=6,
-                return_intermediate=True,
-                transformerlayers=dict(
-                    type="DetrTransformerDecoderLayer",
-                    attn_cfgs=[
-                        dict(
-                            type="MultiheadAttention",
-                            embed_dims=_dim_,
-                            num_heads=8,
-                            dropout=0.1,
-                        ),
-                        dict(
-                            type="CustomMSDeformableAttention",
-                            embed_dims=_dim_,
-                            num_levels=1,
-                        ),
-                    ],
-                    feedforward_channels=_ffn_dim_,
-                    ffn_dropout=0.1,
-                    operation_order=(
-                        "self_attn",
-                        "norm",
-                        "cross_attn",
-                        "norm",
-                        "ffn",
-                        "norm",
-                    ),
-                ),
-            ),
-        ),
-        bbox_coder=dict(
-            type="DETRTrack3DCoder",
-            post_center_range=post_center_range,
-            pc_range=point_cloud_range,
-            max_num=300,
-            num_classes=len(class_names),
-            score_threshold=0.0,
-            with_nms=False,
-            iou_thres=0.3,
-        ),
-        positional_encoding=dict(
-            type="LearnedPositionalEncoding",
-            num_feats=_pos_dim_,
-            row_num_embed=bev_h_,
-            col_num_embed=bev_w_,
-        ),
-        loss_cls=dict(
-            type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=2.0
-        ),
-        loss_bbox=dict(type="L1Loss", loss_weight=0.25),
-        loss_iou=dict(type="GIoULoss", loss_weight=0.0),
-    ),
-    # model training and testing settings
     train_cfg=dict(
         pts=dict(
-            grid_size=[512, 512, 1],
-            voxel_size=voxel_size,
-            point_cloud_range=point_cloud_range,
-            out_size_factor=4,
+            dataset='spd',
             assigner=dict(
-                type="HungarianAssigner3D",
-                cls_cost=dict(type="FocalLossCost", weight=2.0),
-                reg_cost=dict(type="BBox3DL1Cost", weight=0.25),
-                iou_cost=dict(
-                    type="IoUCost", weight=0.0
-                ),  # Fake cost. This is just to make it compatible with DETR head.
+                type='HungarianAssigner3D',
+                cls_cost=dict(type='FocalLossCost', weight=2.0),
+                reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
+                iou_cost=dict(type='IoUCost', weight=0.0),
                 pc_range=point_cloud_range,
+                code_weights=[2.0, 2.0, 1.0, 1.0,
+                              1.0, 1.0, 1.0, 1.0, 0.5, 0.5],
             ),
-        )
-    ),
-)
+            pos_weight=-1,
+            gaussian_overlap=0.1,
+            min_radius=2,
+            grid_size=grid_size,
+            voxel_size=voxel_size,
+            out_size_factor=out_size_factor,
+            code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5],
+            point_cloud_range=point_cloud_range)),
+    test_cfg=dict(
+        pts=dict(
+            dataset='spd',
+            grid_size=grid_size,
+            out_size_factor=out_size_factor,
+            pc_range=point_cloud_range[0:2],
+            voxel_size=voxel_size[:2],
+            nms_type=None,
+            nms_thr=0.2,
+            use_rotate_nms=True,
+            max_num=80
+        )))
 
-file_client_args = dict(backend="disk")
-
-dataset_type = "SPDDataset"
-# data_root = "./datasets/V2X-Seq-SPD-Batch-65-10-10761/infrastructure-side/"
-data_root = "./datasets/V2X-Seq-SPD-New/infrastructure-side/"
-info_root = "./data/infos/V2X-Seq-SPD-New/infrastructure-side/"
-# info_root = "./data/infos/V2X-Seq-SPD-Batch-65-10-10761-forecasting/infrastructure-side/"
-ann_file_train = info_root + f"spd_infos_temporal_train.pkl"
-ann_file_val = info_root + f"spd_infos_temporal_val.pkl"
-ann_file_test = info_root + f"spd_infos_temporal_val.pkl"
-
-# for eval data
-split_datas_file = "./data/split_datas/cooperative-split-data-spd.json"
-
-train_pipeline = [
-    dict(type="LoadMultiViewImageFromFilesInCeph", to_float32=True, file_client_args=file_client_args, img_root=data_root),
-    dict(type="PhotoMetricDistortionMultiViewImage"),
-    dict(
-        type="LoadAnnotations3D_E2E",
-        with_bbox_3d=True,
-        with_label_3d=True,
-        with_attr_label=False,
-
-        with_future_anns=False,  # occ_flow gt
-        with_ins_inds_3d=True,  # ins_inds 
-        ins_inds_add_1=True,  # ins_inds start from 1
-        with_forecasting=False, # future trajectory
-    ),
-    dict(type="ObjectRangeFilterTrack", point_cloud_range=point_cloud_range),
-    dict(type="ObjectNameFilterTrack", classes=class_names),
-    dict(type="NormalizeMultiviewImage", **img_norm_cfg),
-    dict(type='RandomScaleImageMultiViewImage', scales=[0.5]),
-    dict(type="PadMultiViewImage", size_divisor=32),
-    dict(type="DefaultFormatBundle3D", class_names=class_names),
-    dict(
-        type="CustomCollect3D",
-        keys=[
-            "gt_bboxes_3d",
-            "gt_labels_3d",
-            "gt_inds",
-            "img",
-            "timestamp",
-            "l2g_r_mat",
-            "l2g_t",
-        ],
-    ),
-]
-test_pipeline = [
-    dict(type='LoadMultiViewImageFromFilesInCeph', to_float32=True,
-         file_client_args=file_client_args, img_root=data_root),
-    dict(type="NormalizeMultiviewImage", **img_norm_cfg),
-    # dict(type="PadMultiViewImage", size_divisor=32),
-    dict(type='LoadAnnotations3D_E2E',
-         with_bbox_3d=True,
-         with_label_3d=True,
-         with_attr_label=False,
-
-         with_future_anns=False,
-         with_ins_inds_3d=True,
-         ins_inds_add_1=True,  # ins_inds start from 1
-         ),
-    dict(
-        type="MultiScaleFlipAug3D",
-        img_scale=(1600, 900),
-        pts_scale_ratio=1,
-        flip=False,
-        transforms=[
-            dict(type='RandomScaleImageMultiViewImage', scales=[0.5]),
-            dict(type='PadMultiViewImage', size_divisor=32),
-            dict(
-                type="DefaultFormatBundle3D", class_names=class_names, with_label=False
-            ),
-            dict(
-                type="CustomCollect3D", keys=[
-                                            "gt_bboxes_3d",
-                                            "gt_labels_3d",
-                                            "gt_inds",
-                                            "img",
-                                            "timestamp",
-                                            "l2g_r_mat",
-                                            "l2g_t",
-                                        ]
-            ),
-        ],
-    ),
-]
-data = dict(
-    samples_per_gpu=batch_size,
-    workers_per_gpu=8, # 0 is single subprocess
-    train=dict(
-        type=dataset_type,
-        forecasting=False,
-        file_client_args=file_client_args,
-        data_root=data_root,
-        ann_file=ann_file_train,
-        pipeline=train_pipeline,
-        classes=class_names,
-        modality=input_modality,
-        test_mode=False,
-        use_valid_flag=True,
-        patch_size=patch_size,
-        canvas_size=canvas_size,
-        bev_size=(bev_h_, bev_w_),
-        queue_length=queue_length,
-        num_each_seq=num_each_seq,
-        seq_mode=seq_mode,
-        # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
-        # and box_type_3d='Depth' in sunrgbd and scannet dataset.
-        box_type_3d="LiDAR",
-        split_datas_file=split_datas_file,
-        v2x_side='infrastructure_side',
-        class_range=class_range,
-        new_range_100=new_range_100
-    ),
-    val=dict(
-        type=dataset_type,
-        file_client_args=file_client_args,
-        data_root=data_root,
-        ann_file=ann_file_val,
-        pipeline=test_pipeline,
-        patch_size=patch_size,
-        canvas_size=canvas_size,
-        bev_size=(bev_h_, bev_w_),
-        classes=class_names,
-        modality=input_modality,
-        samples_per_gpu=1,
-        eval_mod=['det', 'track'],
-        split_datas_file=split_datas_file,
-        v2x_side='infrastructure_side',
-        class_range=class_range,
-        new_range_100=new_range_100
-    ),
-    test=dict(
-        type=dataset_type,
-        file_client_args=file_client_args,
-        data_root=data_root,
-        test_mode=True,
-        ann_file=ann_file_test,
-        pipeline=test_pipeline,
-        patch_size=patch_size,
-        canvas_size=canvas_size,
-        bev_size=(bev_h_, bev_w_),
-        classes=class_names,
-        modality=input_modality,
-        eval_mod=['det', 'track'],
-        split_datas_file=split_datas_file,
-        v2x_side='infrastructure_side',
-        class_range=class_range,
-        new_range_100=new_range_100
-    ),
-    shuffler_sampler=dict(type="InfiniteGroupEachSampleInBatchSampler"),
-    nonshuffler_sampler=dict(type="DistributedSampler"),
-)
-
-# 8	    2e-4
-# 16	4e-4
-# 32	6e-4
-optimizer = dict(
-    type="AdamW",
-    lr=2e-4,
-    paramwise_cfg=dict(
-        custom_keys={
-            "img_backbone": dict(lr_mult=0.1),
-        }
-    ),
-    weight_decay=0.01,
-)
-optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
-# learning policy
+optimizer = dict(type='AdamW', lr=0.0001, weight_decay=0.01)
+optimizer_config = dict(
+    type='CustomFp16OptimizerHook',
+    loss_scale='dynamic',
+    grad_clip=dict(max_norm=35, norm_type=2),
+    custom_fp16=dict(pts_voxel_encoder=False, pts_middle_encoder=False, pts_bbox_head=False))
 lr_config = dict(
     policy="CosineAnnealing",
     warmup="linear",
     warmup_iters=500,
-    warmup_ratio=1.0 / 3,
-    min_lr_ratio=1e-3,
+    warmup_ratio=1/3,
+    min_lr_ratio=1e-2
 )
-
-evaluation = dict(interval=num_iters_per_epoch*num_epochs, pipeline=test_pipeline)
-runner = dict(type="IterBasedRunner", max_iters=num_epochs * num_iters_per_epoch)
-log_config = dict(
-    interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
-)
+momentum_config = dict(
+    policy='cyclic',
+    target_ratio=(0.8947368421052632, 1),
+    cyclic_times=1,
+    step_ratio_up=0.4)
+total_epochs = 48
+runner = dict(type='IterBasedRunner',
+              max_iters=total_epochs * num_iters_per_epoch)
 checkpoint_config = dict(interval=num_iters_per_epoch*2, max_keep_ckpts=3)
-load_from = "ckpts/cooptrack_det_r50_inf.pth"
-
-find_unused_parameters = True
+log_config = dict(
+    interval=100,
+    hooks=[dict(type='TextLoggerHook'),
+           dict(type='TensorboardLoggerHook')])
+dist_params = dict(backend='nccl')
+log_level = 'INFO'
+work_dir = None
+workflow = [('train', 1)]
+gpu_ids = range(0, 8)
+load_from = None

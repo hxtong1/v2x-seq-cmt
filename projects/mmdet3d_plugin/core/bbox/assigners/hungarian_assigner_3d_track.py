@@ -100,15 +100,20 @@ class HungarianAssigner3DTrack(BaseAssigner):
         cls_cost = self.cls_cost(cls_pred, gt_labels)
         
         # regression L1 cost
+        # gt_bboxes: raw physical, normalized inside assigner
         normalized_gt_bboxes = normalize_bbox(gt_bboxes, self.pc_range)
-        
+        # bbox_pred: head output (cx,cy,cz,log_w,log_l,log_h,sin,cos,vx,vy), reorder to match target
+        bbox_pred_aligned = bbox_pred[:, [0, 1, 3, 4, 2, 5, 6, 7]]
+
         if self.code_weights is not None:
-            # move code_weights to the same device as bbox_pred
             self.code_weights = self.code_weights.to(bbox_pred.device)
-            bbox_pred = bbox_pred * self.code_weights
-            normalized_gt_bboxes = normalized_gt_bboxes * self.code_weights
-            
-        reg_cost = self.reg_cost(bbox_pred[:, :8], normalized_gt_bboxes[:, :8])
+            cw = self.code_weights[:, :8]
+            bbox_pred_aligned = bbox_pred_aligned * cw
+            normalized_gt_bboxes = normalized_gt_bboxes[:, :8] * cw
+        else:
+            normalized_gt_bboxes = normalized_gt_bboxes[:, :8]
+
+        reg_cost = self.reg_cost(bbox_pred_aligned, normalized_gt_bboxes)
         
         # weighted sum of above two costs
         cost = cls_cost + reg_cost

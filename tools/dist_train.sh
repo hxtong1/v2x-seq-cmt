@@ -22,7 +22,10 @@ fi
 
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
-PORT=${PORT:-29500}
+# 动态分配端口，避免多任务并行时 Address already in use
+if [[ -z "$PORT" ]]; then
+  PORT=$(python -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+fi
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
